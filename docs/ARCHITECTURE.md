@@ -10,9 +10,6 @@ Windows compone el escritorio HDR en scRGB lineal. Una captura directa a 8 bits 
 Impr Pant (hook nativo) / Ctrl+Mayús+F11
           │
           ▼
-Selección Win32 de región
-          │
-          ▼
 Windows Graphics Capture
 R16G16B16A16_FLOAT (scRGB)
           │
@@ -25,6 +22,12 @@ DISPLAYCONFIG_SDR_WHITE_LEVEL
           │
           ▼
 Compresión suave de luces HDR + conversión sRGB
+          │
+          ▼
+Fotograma SDR congelado en una ventana Win32 de primer plano
+          │
+          ▼
+Selección y recorte de región
           │
           ├── PNG BGRA 8 bits, sin pérdida
           ├── JPEG BGR 8 bits, calidad configurable
@@ -41,7 +44,11 @@ Una ventana Win32 de solo mensajes gestiona el icono del área de notificación 
 
 ### Selector de región
 
-Es una ventana `WS_EX_LAYERED` situada sobre el monitor bajo el cursor. El color de fondo se vuelve transparente mediante color key. Solo dibuja el marco de selección; al cerrarse se espera brevemente antes de capturar para que no aparezca en el fotograma.
+Antes de abrir el selector se adquiere y convierte a SDR un fotograma completo del monitor. Ese búfer se dibuja en una ventana Win32 opaca, `WS_EX_TOPMOST`, que toma el primer plano. La cruz y el marco aparecen sobre la copia congelada, no sobre la superficie del juego. Esto también cubre juegos a pantalla completa exclusiva: aunque al cambiar el foco el juego se minimice o deje de presentar fotogramas, la imagen que se va a guardar ya está capturada.
+
+La ventana recibe el ratón de forma normal, sin depender de un hook global que un sistema anti-cheat pueda bloquear. Se libera temporalmente `ClipCursor`, se dibuja una cruz propia y se restaura la restricción anterior al terminar. Después se devuelve el primer plano a la ventana que estaba activa.
+
+El recorte se extrae directamente del búfer congelado, por lo que el archivo y el portapapeles contienen exactamente la imagen que se mostró durante la selección. Un clic menor de tres píxeles se ignora y mantiene abierto el selector.
 
 ### Adquisición
 

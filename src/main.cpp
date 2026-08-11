@@ -50,6 +50,8 @@ constexpr wchar_t kWindowClass[] = L"NativeHDRShot.HiddenWindow";
 constexpr UINT kTrayMessage = WM_APP + 1;
 constexpr UINT kCaptureDone = WM_APP + 2;
 constexpr UINT kHookCaptureRequested = WM_APP + 3;
+constexpr UINT kPreviewReady = WM_APP + 4;
+constexpr UINT kRegionSelectionFinalize = WM_APP + 50;
 constexpr UINT kMenuCapture = 100;
 constexpr UINT kMenuOpenFolder = 101;
 constexpr UINT kMenuSettings = 102;
@@ -83,6 +85,10 @@ struct CaptureResult {
     std::wstring clipboardError;
     float peakLinear = 0.0f;
     float sdrWhiteMultiplier = 1.0f;
+    UINT pixelWidth = 0;
+    UINT pixelHeight = 0;
+    UINT pixelStride = 0;
+    std::vector<BYTE> sdrPixels;
 };
 
 CaptureSettings LoadSettings() noexcept {
@@ -480,7 +486,8 @@ bool CopySdrToClipboard(HWND owner, UINT width, UINT height, UINT stride,
 
 CaptureResult CaptureMonitor(HMONITOR monitor, const CaptureSettings& settings,
                              const RECT* requestedRegion = nullptr,
-                             HWND clipboardOwner = nullptr) {
+                             HWND clipboardOwner = nullptr,
+                             bool deferSave = false) {
     CaptureResult result;
     try {
         result.sdrWhiteMultiplier = SdrWhiteLevelMultiplier(monitor);
@@ -562,6 +569,15 @@ CaptureResult CaptureMonitor(HMONITOR monitor, const CaptureSettings& settings,
                 destination[x * 4 + 3] = 255;
             }
         }
+        if (deferSave) {
+            result.pixelWidth = outputWidth;
+            result.pixelHeight = outputHeight;
+            result.pixelStride = sdrStride;
+            result.sdrPixels = std::move(sdrPixels);
+            result.sdrPath.clear();
+            result.ok = true;
+            return result;
+        }
         if (settings.format == OutputFormat::Png) {
             SaveWic(result.sdrPath, GUID_ContainerFormatPng, GUID_WICPixelFormat32bppBGRA,
                     outputWidth, outputHeight, sdrStride, sdrPixels.data(),
@@ -599,6 +615,71 @@ CaptureResult CaptureMonitor(HMONITOR monitor, const CaptureSettings& settings,
         result.error = wide.empty() ? L"Error inesperado" : wide;
     } catch (...) {
         result.error = L"Error inesperado durante la captura";
+    }
+    return result;
+}
+
+CaptureResult SavePreparedCrop(const CaptureResult& prepared, const RECT& requestedRegion,
+                               const CaptureSettings& settings, HWND clipboardOwner) {
+    CaptureResult result;
+    result.peakLinear = prepared.peakLinear;
+    result.sdrWhiteMultiplier = prepared.sdrWhiteMultiplier;
+    try {
+        if (!prepared.ok || prepared.sdrPixels.empty() || prepared.pixelStride == 0)
+            throw hresult_error(E_INVALIDARG, L"El fotograma previo no contiene píxeles SDR");
+
+        RECT crop{};
+        crop.left = std::clamp(requestedRegion.left, 0L, static_cast<LONG>(prepared.pixelWidth));
+        crop.top = std::clamp(requestedRegion.top, 0L, static_cast<LONG>(prepared.pixelHeight));
+        crop.right = std::clamp(requestedRegion.right, crop.left, static_cast<LONG>(prepared.pixelWidth));
+        crop.bottom = std::clamp(requestedRegion.bottom, crop.top, static_cast<LONG>(prepared.pixelHeight));
+        const UINT width = static_cast<UINT>(crop.right - crop.left);
+        const UINT height = static_cast<UINT>(crop.bottom - crop.top);
+        if (width == 0 || height == 0)
+            throw hresult_error(E_INVALIDARG, L"La región seleccionada está vacía");
+
+        const UINT stride = width * 4;
+        std::vector<BYTE> pixels(static_cast<size_t>(stride) * height);
+        for (UINT y = 0; y < height; ++y) {
+            const BYTE* source = prepared.sdrPixels.data() +
+                static_cast<size_t>(prepared.pixelStride) * (y + crop.top) +
+                static_cast<size_t>(crop.left) * 4;
+            std::copy_n(source, stride, pixels.data() + static_cast<size_t>(stride) * y);
+        }
+
+        const auto outputDir = MonthlyOutputDirectory();
+        const auto base = BaseFilename();
+        result.sdrPath = outputDir / (base + (settings.format == OutputFormat::Png ? L".png" : L".jpg"));
+        if (settings.format == OutputFormat::Png) {
+            SaveWic(result.sdrPath, GUID_ContainerFormatPng, GUID_WICPixelFormat32bppBGRA,
+                    width, height, stride, pixels.data(), static_cast<UINT>(pixels.size()));
+        } else {
+            const UINT jpegStride = width * 3;
+            std::vector<BYTE> jpegPixels(static_cast<size_t>(jpegStride) * height);
+            for (UINT y = 0; y < height; ++y) {
+                const BYTE* source = pixels.data() + static_cast<size_t>(stride) * y;
+                BYTE* destination = jpegPixels.data() + static_cast<size_t>(jpegStride) * y;
+                for (UINT x = 0; x < width; ++x) {
+                    destination[x * 3 + 0] = source[x * 4 + 0];
+                    destination[x * 3 + 1] = source[x * 4 + 1];
+                    destination[x * 3 + 2] = source[x * 4 + 2];
+                }
+            }
+            SaveWic(result.sdrPath, GUID_ContainerFormatJpeg, GUID_WICPixelFormat24bppBGR,
+                    width, height, jpegStride, jpegPixels.data(),
+                    static_cast<UINT>(jpegPixels.size()), settings.jpegQuality / 100.0f);
+        }
+        result.clipboardCopied = CopySdrToClipboard(
+            clipboardOwner, width, height, stride, pixels.data(), result.clipboardError);
+        result.ok = true;
+    } catch (const hresult_error& error) {
+        result.error = error.message() + L": " + HResultText(error.code());
+        if (!result.sdrPath.empty()) {
+            std::error_code ignored;
+            std::filesystem::remove(result.sdrPath, ignored);
+        }
+    } catch (...) {
+        result.error = L"Error inesperado al guardar la región congelada";
     }
     return result;
 }
@@ -656,11 +737,80 @@ struct RegionSelectorState {
     bool accepted = false;
     POINT anchor{};
     POINT current{};
+    const CaptureResult* preview = nullptr;
 };
+
+RegionSelectorState* gActiveRegionState = nullptr;
+HWND gActiveRegionWindow = nullptr;
 
 RECT NormalizedRect(POINT first, POINT second) {
     return {std::min(first.x, second.x), std::min(first.y, second.y),
             std::max(first.x, second.x), std::max(first.y, second.y)};
+}
+
+POINT RegionClientPoint(HWND window, POINT screenPoint) {
+    ScreenToClient(window, &screenPoint);
+    return screenPoint;
+}
+
+void BringToForeground(HWND window) {
+    const HWND foreground = GetForegroundWindow();
+    const DWORD currentThread = GetCurrentThreadId();
+    const DWORD foregroundThread = foreground ? GetWindowThreadProcessId(foreground, nullptr) : 0;
+    const bool attached = foregroundThread && foregroundThread != currentThread &&
+        AttachThreadInput(currentThread, foregroundThread, TRUE) != FALSE;
+
+    BringWindowToTop(window);
+    SetForegroundWindow(window);
+    SetActiveWindow(window);
+    SetFocus(window);
+
+    if (attached) AttachThreadInput(currentThread, foregroundThread, FALSE);
+}
+
+LRESULT CALLBACK RegionMouseHookProc(int code, WPARAM wParam, LPARAM lParam) {
+    if (code < 0 || !gActiveRegionState || !IsWindow(gActiveRegionWindow))
+        return CallNextHookEx(nullptr, code, wParam, lParam);
+
+    auto* state = gActiveRegionState;
+    const auto* event = reinterpret_cast<const MSLLHOOKSTRUCT*>(lParam);
+    const POINT point = RegionClientPoint(gActiveRegionWindow, event->pt);
+    SetCursor(LoadCursorW(nullptr, IDC_CROSS));
+
+    switch (wParam) {
+    case WM_LBUTTONDOWN:
+        state->dragging = true;
+        state->anchor = point;
+        state->current = point;
+        InvalidateRect(gActiveRegionWindow, nullptr, TRUE);
+        return 1;
+    case WM_MOUSEMOVE:
+        state->current = point;
+        InvalidateRect(gActiveRegionWindow, nullptr, TRUE);
+        // Let Windows update the pointer position; only mouse buttons are consumed.
+        return CallNextHookEx(nullptr, code, wParam, lParam);
+    case WM_LBUTTONUP: {
+        if (!state->dragging) return 1;
+        state->current = point;
+        const RECT selected = NormalizedRect(state->anchor, state->current);
+        if (selected.right - selected.left >= 3 && selected.bottom - selected.top >= 3) {
+            state->accepted = true;
+            state->done = true;
+            PostMessageW(gActiveRegionWindow, kRegionSelectionFinalize, 0, 0);
+        } else {
+            // Ignore an accidental click; keep the selector open for a real drag.
+            state->dragging = false;
+            InvalidateRect(gActiveRegionWindow, nullptr, TRUE);
+        }
+        return 1;
+    }
+    case WM_RBUTTONDOWN:
+        state->done = true;
+        PostMessageW(gActiveRegionWindow, kRegionSelectionFinalize, 0, 0);
+        return 1;
+    default:
+        return CallNextHookEx(nullptr, code, wParam, lParam);
+    }
 }
 
 LRESULT CALLBACK RegionSelectorProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
@@ -688,10 +838,15 @@ LRESULT CALLBACK RegionSelectorProc(HWND hwnd, UINT message, WPARAM wParam, LPAR
         if (!state->dragging) return 0;
         state->current = {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
         const RECT selected = NormalizedRect(state->anchor, state->current);
-        state->accepted = selected.right - selected.left >= 3 && selected.bottom - selected.top >= 3;
-        state->done = true;
         ReleaseCapture();
-        DestroyWindow(hwnd);
+        if (selected.right - selected.left >= 3 && selected.bottom - selected.top >= 3) {
+            state->accepted = true;
+            state->done = true;
+            DestroyWindow(hwnd);
+        } else {
+            state->dragging = false;
+            InvalidateRect(hwnd, nullptr, TRUE);
+        }
         return 0;
     }
     case WM_RBUTTONDOWN:
@@ -712,6 +867,11 @@ LRESULT CALLBACK RegionSelectorProc(HWND hwnd, UINT message, WPARAM wParam, LPAR
             DestroyWindow(hwnd);
         }
         return 0;
+    case WM_MOUSEACTIVATE:
+        return state->preview ? MA_ACTIVATE : MA_NOACTIVATE;
+    case kRegionSelectionFinalize:
+        DestroyWindow(hwnd);
+        return 0;
     case WM_SETCURSOR:
         SetCursor(LoadCursorW(nullptr, IDC_CROSS));
         return TRUE;
@@ -722,10 +882,23 @@ LRESULT CALLBACK RegionSelectorProc(HWND hwnd, UINT message, WPARAM wParam, LPAR
         HDC dc = BeginPaint(hwnd, &paint);
         RECT client{};
         GetClientRect(hwnd, &client);
-        constexpr COLORREF transparentKey = RGB(1, 2, 3);
-        HBRUSH transparentBrush = CreateSolidBrush(transparentKey);
-        FillRect(dc, &client, transparentBrush);
-        DeleteObject(transparentBrush);
+        if (state->preview && !state->preview->sdrPixels.empty()) {
+            BITMAPINFO bitmap{};
+            bitmap.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+            bitmap.bmiHeader.biWidth = static_cast<LONG>(state->preview->pixelWidth);
+            bitmap.bmiHeader.biHeight = -static_cast<LONG>(state->preview->pixelHeight);
+            bitmap.bmiHeader.biPlanes = 1;
+            bitmap.bmiHeader.biBitCount = 32;
+            bitmap.bmiHeader.biCompression = BI_RGB;
+            StretchDIBits(dc, 0, 0, client.right, client.bottom,
+                          0, 0, state->preview->pixelWidth, state->preview->pixelHeight,
+                          state->preview->sdrPixels.data(), &bitmap, DIB_RGB_COLORS, SRCCOPY);
+        } else {
+            constexpr COLORREF transparentKey = RGB(1, 2, 3);
+            HBRUSH transparentBrush = CreateSolidBrush(transparentKey);
+            FillRect(dc, &client, transparentBrush);
+            DeleteObject(transparentBrush);
+        }
 
         if (state->dragging) {
             RECT selected = NormalizedRect(state->anchor, state->current);
@@ -742,6 +915,23 @@ LRESULT CALLBACK RegionSelectorProc(HWND hwnd, UINT message, WPARAM wParam, LPAR
             SelectObject(dc, oldBrush);
             DeleteObject(border);
         }
+
+        HPEN crossShadow = CreatePen(PS_SOLID, 3, RGB(0, 0, 0));
+        HGDIOBJ oldPen = SelectObject(dc, crossShadow);
+        MoveToEx(dc, state->current.x - 10, state->current.y, nullptr);
+        LineTo(dc, state->current.x + 11, state->current.y);
+        MoveToEx(dc, state->current.x, state->current.y - 10, nullptr);
+        LineTo(dc, state->current.x, state->current.y + 11);
+        SelectObject(dc, oldPen);
+        DeleteObject(crossShadow);
+        HPEN cross = CreatePen(PS_SOLID, 1, RGB(255, 255, 255));
+        oldPen = SelectObject(dc, cross);
+        MoveToEx(dc, state->current.x - 10, state->current.y, nullptr);
+        LineTo(dc, state->current.x + 11, state->current.y);
+        MoveToEx(dc, state->current.x, state->current.y - 10, nullptr);
+        LineTo(dc, state->current.x, state->current.y + 11);
+        SelectObject(dc, oldPen);
+        DeleteObject(cross);
         EndPaint(hwnd, &paint);
         return 0;
     }
@@ -752,7 +942,7 @@ LRESULT CALLBACK RegionSelectorProc(HWND hwnd, UINT message, WPARAM wParam, LPAR
     return DefWindowProcW(hwnd, message, wParam, lParam);
 }
 
-RegionSelection SelectRegion(HMONITOR monitor) {
+RegionSelection SelectRegion(HMONITOR monitor, const CaptureResult* preview = nullptr) {
     RegionSelection selection;
     selection.monitor = monitor;
     MONITORINFO info{sizeof(info)};
@@ -770,18 +960,52 @@ RegionSelection SelectRegion(HMONITOR monitor) {
     if (!classRegistered) return selection;
 
     RegionSelectorState state;
+    state.preview = preview;
     const int width = info.rcMonitor.right - info.rcMonitor.left;
     const int height = info.rcMonitor.bottom - info.rcMonitor.top;
+    const DWORD selectorExStyle = WS_EX_TOPMOST | WS_EX_TOOLWINDOW |
+        (preview ? 0 : WS_EX_NOACTIVATE | WS_EX_LAYERED);
     HWND selector = CreateWindowExW(
-        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED,
+        selectorExStyle,
         L"NativeHDRShot.RegionSelector", L"Seleccionar región", WS_POPUP,
         info.rcMonitor.left, info.rcMonitor.top, width, height,
         nullptr, nullptr, GetModuleHandleW(nullptr), &state);
     if (!selector) return selection;
-    SetLayeredWindowAttributes(selector, RGB(1, 2, 3), 255, LWA_COLORKEY);
-    ShowWindow(selector, SW_SHOW);
-    SetForegroundWindow(selector);
-    SetFocus(selector);
+
+    RECT previousClip{};
+    const bool restoreClip = GetClipCursor(&previousClip) != FALSE;
+    ClipCursor(nullptr);
+
+    POINT cursor{};
+    GetCursorPos(&cursor);
+    state.current = RegionClientPoint(selector, cursor);
+
+    const HWND previousForeground = GetForegroundWindow();
+    HHOOK mouseHook = nullptr;
+    if (!preview) {
+        gActiveRegionState = &state;
+        gActiveRegionWindow = selector;
+        mouseHook = SetWindowsHookExW(
+            WH_MOUSE_LL, RegionMouseHookProc, GetModuleHandleW(nullptr), 0);
+        Log(mouseHook ? L"Selector: hook de ratón activo, ventana original en primer plano" :
+                        L"AVISO selector: no se pudo instalar el hook de ratón; se usa la entrada de ventana");
+    } else {
+        Log(L"Selector congelado activo en primer plano");
+    }
+
+    UINT showFlags = SWP_SHOWWINDOW | SWP_NOOWNERZORDER | SWP_NOACTIVATE;
+    if (preview || !mouseHook) {
+        const LONG_PTR exStyle = GetWindowLongPtrW(selector, GWL_EXSTYLE);
+        SetWindowLongPtrW(selector, GWL_EXSTYLE, exStyle & ~static_cast<LONG_PTR>(WS_EX_NOACTIVATE));
+        showFlags = SWP_SHOWWINDOW | SWP_NOOWNERZORDER | SWP_FRAMECHANGED;
+    }
+
+    if (!preview) SetLayeredWindowAttributes(selector, RGB(1, 2, 3), 255, LWA_COLORKEY);
+    SetWindowPos(selector, HWND_TOPMOST, info.rcMonitor.left, info.rcMonitor.top, width, height,
+                 showFlags);
+    if (preview || !mouseHook) {
+        BringToForeground(selector);
+    }
 
     MSG message{};
     while (!state.done && GetMessageW(&message, nullptr, 0, 0) > 0) {
@@ -789,10 +1013,25 @@ RegionSelection SelectRegion(HMONITOR monitor) {
         DispatchMessageW(&message);
     }
     if (!state.done && message.message == WM_QUIT) PostQuitMessage(static_cast<int>(message.wParam));
+    if (mouseHook) UnhookWindowsHookEx(mouseHook);
+    gActiveRegionState = nullptr;
+    gActiveRegionWindow = nullptr;
     if (IsWindow(selector)) DestroyWindow(selector);
+    if (preview && IsWindow(previousForeground)) {
+        if (IsIconic(previousForeground)) ShowWindow(previousForeground, SW_RESTORE);
+        BringToForeground(previousForeground);
+    }
+    if (restoreClip) ClipCursor(&previousClip);
+    // The frozen preview can take focus safely because the source frame already exists.
     if (state.accepted) {
         selection.accepted = true;
         selection.region = NormalizedRect(state.anchor, state.current);
+        if (preview && width > 0 && height > 0) {
+            selection.region.left = MulDiv(selection.region.left, preview->pixelWidth, width);
+            selection.region.top = MulDiv(selection.region.top, preview->pixelHeight, height);
+            selection.region.right = MulDiv(selection.region.right, preview->pixelWidth, width);
+            selection.region.bottom = MulDiv(selection.region.bottom, preview->pixelHeight, height);
+        }
     }
     return selection;
 }
@@ -1011,6 +1250,33 @@ private:
             if (LOWORD(lParam) == WM_LBUTTONDBLCLK) StartCapture();
             else if (LOWORD(lParam) == WM_RBUTTONUP || LOWORD(lParam) == WM_CONTEXTMENU) ShowTrayMenu();
             return 0;
+        case kPreviewReady: {
+            std::unique_ptr<CaptureResult> prepared(reinterpret_cast<CaptureResult*>(lParam));
+            if (!prepared->ok) {
+                captureActive_ = false;
+                Log(L"ERROR preparando selector: " + prepared->error);
+                Notify(L"No se pudo capturar", prepared->error, NIIF_ERROR);
+                return 0;
+            }
+
+            Log(L"Fotograma congelado listo; abriendo selector");
+            const auto selection = SelectRegion(previewMonitor_, prepared.get());
+            if (!selection.accepted) {
+                captureActive_ = false;
+                Log(L"Selección cancelada");
+                return 0;
+            }
+
+            Log(L"Región seleccionada; guardando fotograma congelado");
+            const CaptureSettings settings = settings_;
+            std::thread([this, selection, settings, prepared = std::move(prepared)]() mutable {
+                init_apartment(apartment_type::multi_threaded);
+                auto result = std::make_unique<CaptureResult>(
+                    SavePreparedCrop(*prepared, selection.region, settings, hwnd_));
+                PostMessageW(hwnd_, kCaptureDone, 0, reinterpret_cast<LPARAM>(result.release()));
+            }).detach();
+            return 0;
+        }
         case kCaptureDone: {
             std::unique_ptr<CaptureResult> result(reinterpret_cast<CaptureResult*>(lParam));
             captureActive_ = false;
@@ -1045,20 +1311,15 @@ private:
             Notify(L"Captura en curso", L"Espera a que termine la captura anterior.", NIIF_INFO);
             return;
         }
-        const auto selection = SelectRegion(MonitorUnderCursor());
-        if (!selection.accepted) {
-            captureActive_ = false;
-            Log(L"Selección cancelada");
-            return;
-        }
-        Log(L"Captura solicitada");
+        previewMonitor_ = MonitorUnderCursor();
+        Log(L"Capturando fotograma previo para el selector");
         const CaptureSettings settings = settings_;
-        std::thread([this, selection, settings] {
+        const HMONITOR monitor = previewMonitor_;
+        std::thread([this, monitor, settings] {
             init_apartment(apartment_type::multi_threaded);
-            std::this_thread::sleep_for(std::chrono::milliseconds(80));
             auto result = std::make_unique<CaptureResult>(
-                CaptureMonitor(selection.monitor, settings, &selection.region, hwnd_));
-            PostMessageW(hwnd_, kCaptureDone, 0, reinterpret_cast<LPARAM>(result.release()));
+                CaptureMonitor(monitor, settings, nullptr, nullptr, true));
+            PostMessageW(hwnd_, kPreviewReady, 0, reinterpret_cast<LPARAM>(result.release()));
         }).detach();
     }
 
@@ -1168,9 +1429,14 @@ private:
         App* self = hookOwner_;
         if (code == HC_ACTION && self) {
             const auto* event = reinterpret_cast<const KBDLLHOOKSTRUCT*>(lParam);
+            const bool keyDown = wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN;
+            const bool keyUp = wParam == WM_KEYUP || wParam == WM_SYSKEYUP;
+            if (gActiveRegionWindow && IsWindow(gActiveRegionWindow) &&
+                (event->vkCode == VK_ESCAPE || event->vkCode == VK_RETURN)) {
+                if (keyDown) PostMessageW(gActiveRegionWindow, WM_KEYDOWN, event->vkCode, 0);
+                return 1;
+            }
             if (event->vkCode == VK_SNAPSHOT) {
-                const bool keyDown = wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN;
-                const bool keyUp = wParam == WM_KEYUP || wParam == WM_SYSKEYUP;
                 if (keyDown && !HasPrintScreenModifiers()) {
                     if (!self->printScreenKeyDown_.exchange(true)) {
                         PostMessageW(self->hwnd_, kHookCaptureRequested, 0, 0);
@@ -1255,6 +1521,7 @@ private:
     HHOOK keyboardHook_ = nullptr;
     NOTIFYICONDATAW tray_{};
     UINT taskbarCreated_ = 0;
+    HMONITOR previewMonitor_ = nullptr;
     bool printScreenRegistered_ = false;
     bool fallbackRegistered_ = false;
     CaptureSettings settings_ = LoadSettings();

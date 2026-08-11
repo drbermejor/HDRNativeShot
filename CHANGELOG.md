@@ -2,6 +2,16 @@
 
 Todas las modificaciones relevantes se documentarán en este archivo.
 
+## 0.4.0 - 2026-08-11
+
+- Captura previa del monitor y selector opaco sobre un fotograma SDR congelado.
+- Ventana nativa de primer plano para mostrar la cruz incluso sobre juegos a pantalla completa exclusiva.
+- Selección independiente del cursor y de los hooks de ratón que pueda bloquear un sistema anti-cheat.
+- Restauración de la ventana que estaba activa al completar o cancelar.
+- El cursor se libera durante la selección y recupera después su restricción previa.
+- Una pulsación corta ya no cancela silenciosamente: el selector espera un arrastre real.
+- Cruce de selección dibujado por NativeHDRShot incluso si el juego oculta el cursor del sistema.
+
 ## 0.3.0 - 2026-08-11
 
 - Copia automática de cada captura SDR al portapapeles mediante `CF_DIBV5`.

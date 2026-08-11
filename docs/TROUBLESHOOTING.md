@@ -15,6 +15,12 @@ El icono normal indica que el hook nativo protege `Impr Pant`. Un icono de adver
 
 El monitor se decide según la posición del cursor cuando se pulsa el atajo. Mueve el cursor al monitor deseado antes de comenzar.
 
+## El juego desaparece o conserva el ratón
+
+Desde la versión 0.4.0 NativeHDRShot captura primero un fotograma completo y abre una copia SDR congelada en primer plano. El registro debe mostrar `Fotograma congelado listo; abriendo selector` y `Selector congelado activo en primer plano`. Seleccionas sobre esa copia, de modo que no importa que el juego pierda el foco, se minimice o retenga su propio cursor. Al terminar se intenta devolver el foco al juego.
+
+No existe una API que eluda el escritorio seguro de Windows, UAC, DRM o una exclusión explícita de captura. Ese contenido puede seguir apareciendo negro por decisión de Windows o de la aplicación.
+
 ## La captura parece demasiado oscura o clara
 
 NativeHDRShot lee el nivel de blanco SDR del monitor en cada captura. Si acabas de modificar el brillo de contenido SDR en la configuración HDR de Windows, realiza una captura nueva. Actualiza también el controlador de la GPU si Windows devuelve un nivel incorrecto.

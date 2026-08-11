@@ -20,6 +20,7 @@ NativeHDRShot utiliza Windows Graphics Capture y Direct3D 11. La captura se real
 - Estado de protección visible en el icono y recuperación manual desde Configuración.
 - Atajo alternativo `Ctrl + Mayús + F11`.
 - Selección limpia: cursor en cruz y marco, sin animaciones ni carteles.
+- Fotograma congelado antes de seleccionar: la cruz se muestra en primer plano incluso sobre juegos a pantalla completa.
 - `Enter` captura el monitor completo y `Esc` cancela.
 - PNG sin pérdida o JPEG con calidad configurable entre 50 y 100 %.
 - Copia automática de la captura SDR al portapapeles de Windows.
@@ -56,6 +57,8 @@ La suma SHA-256 del binario se publica en [`dist/SHA256SUMS.txt`](dist/SHA256SUM
 1. Coloca el cursor en el monitor que quieres capturar.
 2. Pulsa `Impr Pant` o `Ctrl + Mayús + F11`.
 3. Arrastra el cursor para marcar la región.
+
+NativeHDRShot captura primero el monitor completo y muestra esa imagen SDR congelada en una ventana nativa de primer plano. La selección ya no depende de dibujar una transparencia sobre el juego: aunque este pierda el foco, se minimice o use pantalla completa exclusiva, eliges la región sobre el fotograma exacto que se va a guardar. Al terminar se devuelve el foco a la ventana anterior.
 
 Durante la selección:
 
