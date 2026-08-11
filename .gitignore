@@ -1,0 +1,21 @@
+# Visual Studio / MSBuild
+.vs/
+bin/
+bin-debug/
+obj/
+obj-debug/
+*.user
+*.suo
+*.pdb
+*.iobj
+*.ipdb
+
+# Local tooling
+.vscode/
+*.log
+*.tmp
+Thumbs.db
+Desktop.ini
+
+# Keep the redistributable release binary.
+!dist/NativeHDRShot.exe
