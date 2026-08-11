@@ -21,11 +21,12 @@ NativeHDRShot utiliza Windows Graphics Capture y Direct3D 11. La captura se real
 - Atajo alternativo `Ctrl + Mayús + F11`.
 - Selección limpia: cursor en cruz y marco, sin animaciones ni carteles.
 - Fotograma congelado antes de seleccionar: la cruz se muestra en primer plano incluso sobre juegos a pantalla completa.
-- `Enter` captura el monitor completo y `Esc` cancela.
+- `Enter` captura el escritorio virtual completo y `Esc` cancela.
 - PNG sin pérdida o JPEG con calidad configurable entre 50 y 100 %.
 - Copia automática de la captura SDR al portapapeles de Windows.
-- Selecciona automáticamente el monitor situado bajo el cursor.
-- Compatible con escalado DPI y configuraciones multimonitor.
+- Aviso visual discreto al completar la captura, incluso si Windows silencia las notificaciones de bandeja.
+- Selector continuo a través de todos los monitores, incluso con posiciones y resoluciones diferentes.
+- Conversión HDR→SDR independiente para cada monitor y compatibilidad con escalado DPI.
 - Reinicializa D3D en cada captura para recuperarse de suspensión, cambios de pantalla o reinicios del controlador.
 - Icono residente, registro de diagnóstico e inicio automático con Windows.
 - Sin Electron, servicios en la nube, telemetría ni dependencias externas durante la ejecución.
@@ -33,39 +34,41 @@ NativeHDRShot utiliza Windows Graphics Capture y Direct3D 11. La captura se real
 ## Instalación rápida
 
 1. Descarga el ZIP del repositorio desde `Code → Download ZIP` y extráelo.
-2. Ejecuta [`install.cmd`](install.cmd).
+2. Ejecuta [`install.cmd`](install.cmd) y acepta la solicitud de UAC.
 3. NativeHDRShot aparecerá en el área de notificación y quedará configurado para el próximo inicio de sesión.
 
-La instalación es únicamente para el usuario actual y no requiere permisos de administrador. Copia el programa a:
+La elevación permite interceptar `Impr Pant` y mostrar el selector también sobre ventanas ejecutadas como administrador. El instalador guarda el ejecutable en una ubicación protegida:
 
 ```text
-%LOCALAPPDATA%\NativeHDRShot\NativeHDRShot.exe
+%ProgramFiles%\NativeHDRShot\NativeHDRShot.exe
 ```
 
-También crea este acceso directo de inicio:
+El inicio automático se registra para el usuario actual mediante una tarea programada con el nivel de integridad más alto:
 
 ```text
-%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\NativeHDRShot.lnk
+Tarea programada: NativeHDRShot
 ```
 
-El ejecutable incluido en [`dist`](dist) no está firmado digitalmente. Windows SmartScreen puede mostrar una advertencia la primera vez; revisa el código o compílalo localmente si prefieres no ejecutar el binario distribuido.
+UAC solo se solicita al instalar, actualizar o desinstalar. Los siguientes inicios de sesión ejecutan la tarea registrada sin mostrar otra confirmación.
+
+El ejecutable incluido en [`dist`](dist) no está firmado digitalmente. Windows SmartScreen puede mostrar una advertencia la primera vez; revisa el código o compílalo localmente si prefieres no ejecutar el binario distribuido. Al ejecutarlo directamente también solicitará elevación.
 
 La suma SHA-256 del binario se publica en [`dist/SHA256SUMS.txt`](dist/SHA256SUMS.txt).
 
 ## Uso
 
-1. Coloca el cursor en el monitor que quieres capturar.
-2. Pulsa `Impr Pant` o `Ctrl + Mayús + F11`.
-3. Arrastra el cursor para marcar la región.
+1. Pulsa `Impr Pant` o `Ctrl + Mayús + F11`.
+2. Mueve la cruz libremente entre tus pantallas.
+3. Arrastra el cursor para marcar una región en uno o varios monitores.
 
-NativeHDRShot captura primero el monitor completo y muestra esa imagen SDR congelada en una ventana nativa de primer plano. La selección ya no depende de dibujar una transparencia sobre el juego: aunque este pierda el foco, se minimice o use pantalla completa exclusiva, eliges la región sobre el fotograma exacto que se va a guardar. Al terminar se devuelve el foco a la ventana anterior.
+NativeHDRShot captura primero cada monitor, aplica a cada uno su conversión SDR y compone un fotograma congelado del escritorio virtual. La selección ya no depende de dibujar una transparencia sobre la aplicación: puedes cruzar los límites entre pantallas y eliges la región sobre la imagen exacta que se va a guardar. Al terminar se devuelve el foco a la ventana anterior.
 
 Durante la selección:
 
 | Acción | Resultado |
 |---|---|
 | Arrastrar con el botón izquierdo | Capturar región |
-| `Enter` | Capturar el monitor completo |
+| `Enter` | Capturar el escritorio virtual completo |
 | `Esc` o botón derecho | Cancelar |
 
 Las imágenes se guardan por mes en:

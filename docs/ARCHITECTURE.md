@@ -17,14 +17,14 @@ R16G16B16A16_FLOAT (scRGB)
 Lectura D3D11 en CPU
           │
           ▼
-Normalización del blanco SDR del monitor
+Normalización del blanco SDR de cada monitor
 DISPLAYCONFIG_SDR_WHITE_LEVEL
           │
           ▼
 Compresión suave de luces HDR + conversión sRGB
           │
           ▼
-Fotograma SDR congelado en una ventana Win32 de primer plano
+Composición SDR congelada del escritorio virtual
           │
           ▼
 Selección y recorte de región
@@ -44,15 +44,17 @@ Una ventana Win32 de solo mensajes gestiona el icono del área de notificación 
 
 ### Selector de región
 
-Antes de abrir el selector se adquiere y convierte a SDR un fotograma completo del monitor. Ese búfer se dibuja en una ventana Win32 opaca, `WS_EX_TOPMOST`, que toma el primer plano. La cruz y el marco aparecen sobre la copia congelada, no sobre la superficie del juego. Esto también cubre juegos a pantalla completa exclusiva: aunque al cambiar el foco el juego se minimice o deje de presentar fotogramas, la imagen que se va a guardar ya está capturada.
+Antes de abrir el selector se adquiere un fotograma de cada monitor. Cada imagen se convierte a SDR con los parámetros de su propia pantalla y después se coloca en un búfer que reproduce las coordenadas del escritorio virtual. Ese búfer se dibuja en una única ventana Win32 opaca, `WS_EX_TOPMOST`, que abarca todos los monitores y toma el primer plano. La cruz y el marco aparecen sobre la copia congelada, no sobre las superficies originales.
 
 La ventana recibe el ratón de forma normal, sin depender de un hook global que un sistema anti-cheat pueda bloquear. Se libera temporalmente `ClipCursor`, se dibuja una cruz propia y se restaura la restricción anterior al terminar. Después se devuelve el primer plano a la ventana que estaba activa.
 
-El recorte se extrae directamente del búfer congelado, por lo que el archivo y el portapapeles contienen exactamente la imagen que se mostró durante la selección. Un clic menor de tres píxeles se ignora y mantiene abierto el selector.
+Mientras la selección está abierta, un temporizador de vida corta reafirma la posición del selector en la banda `TOPMOST` y recupera el primer plano si otra ventana intenta ocuparlo. Esta vigilancia desaparece junto con el selector y no permanece activa en segundo plano.
+
+El recorte se extrae directamente del búfer congelado y puede atravesar los límites entre monitores. El archivo y el portapapeles contienen exactamente la imagen mostrada durante la selección. Un clic menor de tres píxeles se ignora y mantiene abierto el selector.
 
 ### Adquisición
 
-Para cada captura se crea un dispositivo D3D11 en el adaptador que controla el monitor seleccionado. `Windows.Graphics.Capture` entrega un fotograma flotante de 16 bits por componente. El recurso se copia a una textura staging legible por CPU.
+Para cada monitor se crea un dispositivo D3D11 en el adaptador que lo controla. `Windows.Graphics.Capture` entrega un fotograma flotante de 16 bits por componente. El recurso se copia a una textura staging legible por CPU y, tras convertirlo, se compone en sus coordenadas físicas dentro del escritorio virtual.
 
 Los objetos D3D y la sesión se recrean en cada operación. Esto añade un coste pequeño, pero evita conservar dispositivos inválidos después de suspensión, cambio de monitor o reinicio del controlador gráfico.
 
@@ -75,7 +77,7 @@ Windows Imaging Component codifica el búfer SDR:
 
 ### Persistencia
 
-Las preferencias se almacenan bajo `HKCU\Software\NativeHDRShot`. El instalador crea un acceso directo en la carpeta Inicio del usuario; no instala servicios ni controladores.
+Las preferencias se almacenan bajo `HKCU\Software\NativeHDRShot`. El ejecutable se instala en `%ProgramFiles%\NativeHDRShot` y una tarea programada vinculada al inicio de sesión lo ejecuta con el nivel de integridad más alto. Esto permite que el hook y el selector funcionen sobre procesos elevados sin depender de `uiAccess`, certificados instalados, servicios ni controladores.
 
 ## Recuperación y diagnóstico
 

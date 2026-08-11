@@ -2,6 +2,21 @@
 
 Todas las modificaciones relevantes se documentarán en este archivo.
 
+## 0.4.1 - 2026-08-11
+
+- Selector continuo sobre el escritorio virtual completo y regiones que pueden abarcar varios monitores.
+- Captura y conversión HDR→SDR separada para cada pantalla antes de componer el fotograma congelado.
+- Selección automática del monitor ocupado por la ventana a pantalla completa, aunque el cursor haya quedado en otra pantalla.
+- Comprobación real de que el selector obtuvo el primer plano.
+- Recuperación para superficies exclusivas que no ceden el primer plano, restaurando la ventana anterior al terminar.
+- Registro de las coordenadas, resolución y criterio usado para elegir el monitor.
+- Confirmación visual propia al guardar, independiente de las notificaciones que Windows puede ocultar en pantalla completa.
+- Vigilancia temporal de la banda `TOPMOST` para recuperar el selector si otra ventana intenta superponerse durante la selección.
+- Instalación protegida en `Program Files` y arranque elevado mediante tarea programada para funcionar sobre ventanas administrativas.
+- Manifiesto `requireAdministrator` para impedir ejecuciones accidentales con un nivel de integridad insuficiente.
+- Captura y conversión simultánea de los monitores para reducir el retardo antes de mostrar el selector.
+- Actualización del binario elevado después de detener la tarea, evitando bloqueos del ejecutable instalado.
+
 ## 0.4.0 - 2026-08-11
 
 - Captura previa del monitor y selector opaco sobre un fotograma SDR congelado.

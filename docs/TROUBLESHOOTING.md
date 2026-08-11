@@ -7,19 +7,23 @@
 3. Prueba `Ctrl + Mayús + F11`.
 4. Cierra otras herramientas de captura que usen `Impr Pant`.
 5. En Windows, revisa **Configuración → Accesibilidad → Teclado → Usar el botón Impr Pant para abrir Recortes de pantalla**.
-6. Reinicia NativeHDRShot desde `%LOCALAPPDATA%\NativeHDRShot\NativeHDRShot.exe`.
+6. Comprueba en el Programador de tareas que la tarea `NativeHDRShot` esté habilitada y ejecútala de nuevo.
 
 El icono normal indica que el hook nativo protege `Impr Pant`. Un icono de advertencia indica que el hook no está activo; NativeHDRShot intentará mantener la captura mediante la reserva del atajo. Al arrancar, el registro indica el estado del hook, la reserva y el atajo alternativo.
 
-## El selector aparece en otro monitor
+## No funciona sobre una ventana ejecutada como administrador
 
-El monitor se decide según la posición del cursor cuando se pulsa el atajo. Mueve el cursor al monitor deseado antes de comenzar.
+Instala la versión 0.4.1 o posterior mediante `install.cmd` y acepta UAC. El registro de inicio debe terminar con `integridad=elevada`. Una ejecución manual con integridad estándar no puede interceptar entradas destinadas a procesos elevados debido al aislamiento de privilegios de Windows.
+
+## El selector no cubre todos los monitores
+
+Desde la versión 0.4.1 el selector compone y cubre el escritorio virtual completo. El registro debe indicar `Fotograma virtual compuesto con N monitores`. Si falta una pantalla, comprueba que Windows la tenga configurada como **Extender estas pantallas** y vuelve a iniciar NativeHDRShot tras conectarla.
 
 ## El juego desaparece o conserva el ratón
 
-Desde la versión 0.4.0 NativeHDRShot captura primero un fotograma completo y abre una copia SDR congelada en primer plano. El registro debe mostrar `Fotograma congelado listo; abriendo selector` y `Selector congelado activo en primer plano`. Seleccionas sobre esa copia, de modo que no importa que el juego pierda el foco, se minimice o retenga su propio cursor. Al terminar se intenta devolver el foco al juego.
+NativeHDRShot captura primero todos los monitores y abre una copia SDR congelada en primer plano. El registro debe mostrar `Fotograma virtual compuesto con N monitores`, `Fotograma congelado listo; abriendo selector` y `Selector congelado activo en primer plano`. Seleccionas sobre esa copia, de modo que no importa que una aplicación pierda el foco, se minimice o retenga su propio cursor. Al terminar se intenta devolver el foco a la ventana anterior.
 
-No existe una API que eluda el escritorio seguro de Windows, UAC, DRM o una exclusión explícita de captura. Ese contenido puede seguir apareciendo negro por decisión de Windows o de la aplicación.
+La aplicación elevada puede trabajar sobre ventanas administrativas normales, pero no existe una API que eluda el escritorio seguro donde aparece la propia confirmación de UAC, DRM o una exclusión explícita de captura. Ese contenido puede seguir apareciendo negro por decisión de Windows o de la aplicación.
 
 ## La captura parece demasiado oscura o clara
 

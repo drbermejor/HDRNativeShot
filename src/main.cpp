@@ -28,6 +28,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iomanip>
 #include <limits>
 #include <memory>
@@ -52,6 +53,8 @@ constexpr UINT kCaptureDone = WM_APP + 2;
 constexpr UINT kHookCaptureRequested = WM_APP + 3;
 constexpr UINT kPreviewReady = WM_APP + 4;
 constexpr UINT kRegionSelectionFinalize = WM_APP + 50;
+constexpr UINT_PTR kCaptureNotificationTimer = 1;
+constexpr UINT_PTR kRegionTopmostTimer = 2;
 constexpr UINT kMenuCapture = 100;
 constexpr UINT kMenuOpenFolder = 101;
 constexpr UINT kMenuSettings = 102;
@@ -89,6 +92,7 @@ struct CaptureResult {
     UINT pixelHeight = 0;
     UINT pixelStride = 0;
     std::vector<BYTE> sdrPixels;
+    RECT captureBounds{};
 };
 
 CaptureSettings LoadSettings() noexcept {
@@ -135,6 +139,18 @@ std::wstring HResultText(HRESULT hr) {
     std::wostringstream formatted;
     formatted << result << L" (0x" << std::hex << std::uppercase << static_cast<unsigned long>(hr) << L")";
     return formatted.str();
+}
+
+bool IsProcessElevated() noexcept {
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return false;
+    TOKEN_ELEVATION elevation{};
+    DWORD returned = 0;
+    const bool elevated = GetTokenInformation(
+        token, TokenElevation, &elevation, sizeof(elevation), &returned) != FALSE &&
+        elevation.TokenIsElevated != 0;
+    CloseHandle(token);
+    return elevated;
 }
 
 std::filesystem::path KnownFolder(REFKNOWNFOLDERID id) {
@@ -536,10 +552,6 @@ CaptureResult CaptureMonitor(HMONITOR monitor, const CaptureSettings& settings,
         }
         result.peakLinear = peak / result.sdrWhiteMultiplier;
 
-        const auto outputDir = MonthlyOutputDirectory();
-        const auto base = BaseFilename();
-        result.sdrPath = outputDir / (base + (settings.format == OutputFormat::Png ? L".png" : L".jpg"));
-
         const UINT sdrStride = outputWidth * 4;
         std::vector<BYTE> sdrPixels(static_cast<size_t>(sdrStride) * outputHeight);
         const bool toneMap = result.peakLinear > 1.01f;
@@ -574,10 +586,15 @@ CaptureResult CaptureMonitor(HMONITOR monitor, const CaptureSettings& settings,
             result.pixelHeight = outputHeight;
             result.pixelStride = sdrStride;
             result.sdrPixels = std::move(sdrPixels);
+            MONITORINFO monitorInfo{sizeof(monitorInfo)};
+            if (GetMonitorInfoW(monitor, &monitorInfo)) result.captureBounds = monitorInfo.rcMonitor;
             result.sdrPath.clear();
             result.ok = true;
             return result;
         }
+        const auto outputDir = MonthlyOutputDirectory();
+        const auto base = BaseFilename();
+        result.sdrPath = outputDir / (base + (settings.format == OutputFormat::Png ? L".png" : L".jpg"));
         if (settings.format == OutputFormat::Png) {
             SaveWic(result.sdrPath, GUID_ContainerFormatPng, GUID_WICPixelFormat32bppBGRA,
                     outputWidth, outputHeight, sdrStride, sdrPixels.data(),
@@ -615,6 +632,125 @@ CaptureResult CaptureMonitor(HMONITOR monitor, const CaptureSettings& settings,
         result.error = wide.empty() ? L"Error inesperado" : wide;
     } catch (...) {
         result.error = L"Error inesperado durante la captura";
+    }
+    return result;
+}
+
+struct MonitorDescriptor {
+    HMONITOR handle = nullptr;
+    RECT bounds{};
+};
+
+BOOL CALLBACK CollectMonitor(HMONITOR monitor, HDC, LPRECT bounds, LPARAM data) {
+    auto* monitors = reinterpret_cast<std::vector<MonitorDescriptor>*>(data);
+    monitors->push_back({monitor, *bounds});
+    return TRUE;
+}
+
+CaptureResult CaptureVirtualDesktop(const CaptureSettings& settings, HMONITOR referenceMonitor) {
+    CaptureResult result;
+    try {
+        const auto started = std::chrono::steady_clock::now();
+        std::vector<MonitorDescriptor> monitors;
+        if (!EnumDisplayMonitors(nullptr, nullptr, CollectMonitor,
+                                 reinterpret_cast<LPARAM>(&monitors)) || monitors.empty()) {
+            throw hresult_error(HRESULT_FROM_WIN32(GetLastError()),
+                                L"No se pudieron enumerar los monitores");
+        }
+
+        RECT desktop = monitors.front().bounds;
+        for (const auto& monitor : monitors) {
+            desktop.left = std::min(desktop.left, monitor.bounds.left);
+            desktop.top = std::min(desktop.top, monitor.bounds.top);
+            desktop.right = std::max(desktop.right, monitor.bounds.right);
+            desktop.bottom = std::max(desktop.bottom, monitor.bounds.bottom);
+        }
+        const LONG desktopWidth = desktop.right - desktop.left;
+        const LONG desktopHeight = desktop.bottom - desktop.top;
+        if (desktopWidth <= 0 || desktopHeight <= 0)
+            throw hresult_error(E_INVALIDARG, L"El escritorio virtual está vacío");
+
+        result.pixelWidth = static_cast<UINT>(desktopWidth);
+        result.pixelHeight = static_cast<UINT>(desktopHeight);
+        result.pixelStride = result.pixelWidth * 4;
+        result.captureBounds = desktop;
+        result.sdrPixels.resize(static_cast<size_t>(result.pixelStride) * result.pixelHeight);
+        for (size_t pixel = 0; pixel < result.sdrPixels.size(); pixel += 4) {
+            result.sdrPixels[pixel + 0] = 18;
+            result.sdrPixels[pixel + 1] = 18;
+            result.sdrPixels[pixel + 2] = 18;
+            result.sdrPixels[pixel + 3] = 255;
+        }
+
+        std::vector<std::future<CaptureResult>> captures;
+        captures.reserve(monitors.size());
+        for (const auto& monitor : monitors) {
+            const HMONITOR handle = monitor.handle;
+            captures.push_back(std::async(std::launch::async, [handle, settings] {
+                init_apartment(apartment_type::multi_threaded);
+                return CaptureMonitor(handle, settings, nullptr, nullptr, true);
+            }));
+        }
+
+        for (size_t monitorIndex = 0; monitorIndex < monitors.size(); ++monitorIndex) {
+            const auto& monitor = monitors[monitorIndex];
+            CaptureResult part = captures[monitorIndex].get();
+            if (!part.ok) {
+                result.error = L"No se pudo congelar uno de los monitores: " + part.error;
+                return result;
+            }
+
+            const LONG destinationLeft = monitor.bounds.left - desktop.left;
+            const LONG destinationTop = monitor.bounds.top - desktop.top;
+            const UINT destinationWidth = static_cast<UINT>(monitor.bounds.right - monitor.bounds.left);
+            const UINT destinationHeight = static_cast<UINT>(monitor.bounds.bottom - monitor.bounds.top);
+            if (destinationWidth == 0 || destinationHeight == 0 ||
+                part.pixelWidth == 0 || part.pixelHeight == 0) {
+                result.error = L"Uno de los monitores devolvió un fotograma vacío";
+                return result;
+            }
+
+            if (destinationWidth == part.pixelWidth && destinationHeight == part.pixelHeight) {
+                for (UINT y = 0; y < destinationHeight; ++y) {
+                    const BYTE* source = part.sdrPixels.data() +
+                        static_cast<size_t>(part.pixelStride) * y;
+                    BYTE* destination = result.sdrPixels.data() +
+                        static_cast<size_t>(result.pixelStride) * (destinationTop + y) +
+                        static_cast<size_t>(destinationLeft) * 4;
+                    std::copy_n(source, static_cast<size_t>(destinationWidth) * 4, destination);
+                }
+            } else {
+                for (UINT y = 0; y < destinationHeight; ++y) {
+                    const UINT sourceY = static_cast<UINT>(
+                        static_cast<uint64_t>(y) * part.pixelHeight / destinationHeight);
+                    BYTE* destination = result.sdrPixels.data() +
+                        static_cast<size_t>(result.pixelStride) * (destinationTop + y) +
+                        static_cast<size_t>(destinationLeft) * 4;
+                    for (UINT x = 0; x < destinationWidth; ++x) {
+                        const UINT sourceX = static_cast<UINT>(
+                            static_cast<uint64_t>(x) * part.pixelWidth / destinationWidth);
+                        const BYTE* source = part.sdrPixels.data() +
+                            static_cast<size_t>(part.pixelStride) * sourceY +
+                            static_cast<size_t>(sourceX) * 4;
+                        std::copy_n(source, 4, destination + static_cast<size_t>(x) * 4);
+                    }
+                }
+            }
+
+            result.peakLinear = std::max(result.peakLinear, part.peakLinear);
+            if (monitor.handle == referenceMonitor)
+                result.sdrWhiteMultiplier = part.sdrWhiteMultiplier;
+        }
+
+        result.ok = true;
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - started).count();
+        Log(L"Fotograma virtual compuesto con " + std::to_wstring(monitors.size()) +
+            L" monitores en " + std::to_wstring(elapsed) + L" ms");
+    } catch (const hresult_error& error) {
+        result.error = error.message() + L": " + HResultText(error.code());
+    } catch (...) {
+        result.error = L"Error inesperado al componer el escritorio virtual";
     }
     return result;
 }
@@ -690,6 +826,32 @@ HMONITOR MonitorUnderCursor() {
     return MonitorFromPoint(cursor, MONITOR_DEFAULTTOPRIMARY);
 }
 
+HMONITOR CaptureTargetMonitor(bool& usedFullscreenWindow) {
+    usedFullscreenWindow = false;
+    const HWND foreground = GetForegroundWindow();
+    if (foreground && IsWindowVisible(foreground) && !IsIconic(foreground)) {
+        const HMONITOR foregroundMonitor = MonitorFromWindow(foreground, MONITOR_DEFAULTTONULL);
+        MONITORINFO monitorInfo{sizeof(monitorInfo)};
+        RECT windowRect{};
+        RECT intersection{};
+        if (foregroundMonitor && GetMonitorInfoW(foregroundMonitor, &monitorInfo) &&
+            GetWindowRect(foreground, &windowRect) &&
+            IntersectRect(&intersection, &windowRect, &monitorInfo.rcMonitor)) {
+            const int64_t monitorWidth = monitorInfo.rcMonitor.right - monitorInfo.rcMonitor.left;
+            const int64_t monitorHeight = monitorInfo.rcMonitor.bottom - monitorInfo.rcMonitor.top;
+            const int64_t coveredWidth = intersection.right - intersection.left;
+            const int64_t coveredHeight = intersection.bottom - intersection.top;
+            const int64_t monitorArea = monitorWidth * monitorHeight;
+            const int64_t coveredArea = coveredWidth * coveredHeight;
+            if (monitorArea > 0 && coveredArea * 100 >= monitorArea * 90) {
+                usedFullscreenWindow = true;
+                return foregroundMonitor;
+            }
+        }
+    }
+    return MonitorUnderCursor();
+}
+
 float SdrWhiteLevelMultiplier(HMONITOR monitor) noexcept {
     MONITORINFOEXW monitorInfo{};
     monitorInfo.cbSize = sizeof(monitorInfo);
@@ -738,6 +900,7 @@ struct RegionSelectorState {
     POINT anchor{};
     POINT current{};
     const CaptureResult* preview = nullptr;
+    bool foregroundRecovered = false;
 };
 
 RegionSelectorState* gActiveRegionState = nullptr;
@@ -753,19 +916,22 @@ POINT RegionClientPoint(HWND window, POINT screenPoint) {
     return screenPoint;
 }
 
-void BringToForeground(HWND window) {
+bool BringToForeground(HWND window) {
     const HWND foreground = GetForegroundWindow();
     const DWORD currentThread = GetCurrentThreadId();
     const DWORD foregroundThread = foreground ? GetWindowThreadProcessId(foreground, nullptr) : 0;
     const bool attached = foregroundThread && foregroundThread != currentThread &&
         AttachThreadInput(currentThread, foregroundThread, TRUE) != FALSE;
 
+    ShowWindowAsync(window, SW_SHOW);
     BringWindowToTop(window);
+    SwitchToThisWindow(window, TRUE);
     SetForegroundWindow(window);
     SetActiveWindow(window);
     SetFocus(window);
 
     if (attached) AttachThreadInput(currentThread, foregroundThread, FALSE);
+    return GetForegroundWindow() == window;
 }
 
 LRESULT CALLBACK RegionMouseHookProc(int code, WPARAM wParam, LPARAM lParam) {
@@ -867,6 +1033,19 @@ LRESULT CALLBACK RegionSelectorProc(HWND hwnd, UINT message, WPARAM wParam, LPAR
             DestroyWindow(hwnd);
         }
         return 0;
+    case WM_TIMER:
+        if (wParam == kRegionTopmostTimer) {
+            SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW);
+            if (GetForegroundWindow() != hwnd) {
+                const bool recovered = BringToForeground(hwnd);
+                if (recovered && !state->foregroundRecovered) {
+                    state->foregroundRecovered = true;
+                    Log(L"Selector: primer plano recuperado frente a otra ventana");
+                }
+            }
+        }
+        return 0;
     case WM_MOUSEACTIVATE:
         return state->preview ? MA_ACTIVATE : MA_NOACTIVATE;
     case kRegionSelectionFinalize:
@@ -936,6 +1115,7 @@ LRESULT CALLBACK RegionSelectorProc(HWND hwnd, UINT message, WPARAM wParam, LPAR
         return 0;
     }
     case WM_DESTROY:
+        KillTimer(hwnd, kRegionTopmostTimer);
         state->done = true;
         return 0;
     }
@@ -947,6 +1127,11 @@ RegionSelection SelectRegion(HMONITOR monitor, const CaptureResult* preview = nu
     selection.monitor = monitor;
     MONITORINFO info{sizeof(info)};
     if (!GetMonitorInfoW(monitor, &info)) return selection;
+    RECT selectorBounds = info.rcMonitor;
+    if (preview && preview->captureBounds.right > preview->captureBounds.left &&
+        preview->captureBounds.bottom > preview->captureBounds.top) {
+        selectorBounds = preview->captureBounds;
+    }
 
     static bool classRegistered = false;
     if (!classRegistered) {
@@ -961,14 +1146,14 @@ RegionSelection SelectRegion(HMONITOR monitor, const CaptureResult* preview = nu
 
     RegionSelectorState state;
     state.preview = preview;
-    const int width = info.rcMonitor.right - info.rcMonitor.left;
-    const int height = info.rcMonitor.bottom - info.rcMonitor.top;
+    const int width = selectorBounds.right - selectorBounds.left;
+    const int height = selectorBounds.bottom - selectorBounds.top;
     const DWORD selectorExStyle = WS_EX_TOPMOST | WS_EX_TOOLWINDOW |
         (preview ? 0 : WS_EX_NOACTIVATE | WS_EX_LAYERED);
     HWND selector = CreateWindowExW(
         selectorExStyle,
         L"NativeHDRShot.RegionSelector", L"Seleccionar región", WS_POPUP,
-        info.rcMonitor.left, info.rcMonitor.top, width, height,
+        selectorBounds.left, selectorBounds.top, width, height,
         nullptr, nullptr, GetModuleHandleW(nullptr), &state);
     if (!selector) return selection;
 
@@ -981,16 +1166,15 @@ RegionSelection SelectRegion(HMONITOR monitor, const CaptureResult* preview = nu
     state.current = RegionClientPoint(selector, cursor);
 
     const HWND previousForeground = GetForegroundWindow();
+    bool minimizedPreviousWindow = false;
+    gActiveRegionState = &state;
+    gActiveRegionWindow = selector;
     HHOOK mouseHook = nullptr;
     if (!preview) {
-        gActiveRegionState = &state;
-        gActiveRegionWindow = selector;
         mouseHook = SetWindowsHookExW(
             WH_MOUSE_LL, RegionMouseHookProc, GetModuleHandleW(nullptr), 0);
         Log(mouseHook ? L"Selector: hook de ratón activo, ventana original en primer plano" :
                         L"AVISO selector: no se pudo instalar el hook de ratón; se usa la entrada de ventana");
-    } else {
-        Log(L"Selector congelado activo en primer plano");
     }
 
     UINT showFlags = SWP_SHOWWINDOW | SWP_NOOWNERZORDER | SWP_NOACTIVATE;
@@ -1001,11 +1185,24 @@ RegionSelection SelectRegion(HMONITOR monitor, const CaptureResult* preview = nu
     }
 
     if (!preview) SetLayeredWindowAttributes(selector, RGB(1, 2, 3), 255, LWA_COLORKEY);
-    SetWindowPos(selector, HWND_TOPMOST, info.rcMonitor.left, info.rcMonitor.top, width, height,
+    SetWindowPos(selector, HWND_TOPMOST, selectorBounds.left, selectorBounds.top, width, height,
                  showFlags);
     if (preview || !mouseHook) {
-        BringToForeground(selector);
+        bool foregroundAcquired = BringToForeground(selector);
+        if (preview && !foregroundAcquired && IsWindow(previousForeground) &&
+            previousForeground != selector) {
+            minimizedPreviousWindow = ShowWindowAsync(previousForeground, SW_MINIMIZE) != FALSE;
+            foregroundAcquired = BringToForeground(selector);
+        }
+        if (preview) {
+            Log(foregroundAcquired
+                ? (minimizedPreviousWindow
+                    ? L"Selector congelado activo; se restaurará la ventana anterior"
+                    : L"Selector congelado activo en primer plano")
+                : L"AVISO selector: Windows no concedió el primer plano");
+        }
     }
+    SetTimer(selector, kRegionTopmostTimer, 100, nullptr);
 
     MSG message{};
     while (!state.done && GetMessageW(&message, nullptr, 0, 0) > 0) {
@@ -1018,7 +1215,8 @@ RegionSelection SelectRegion(HMONITOR monitor, const CaptureResult* preview = nu
     gActiveRegionWindow = nullptr;
     if (IsWindow(selector)) DestroyWindow(selector);
     if (preview && IsWindow(previousForeground)) {
-        if (IsIconic(previousForeground)) ShowWindow(previousForeground, SW_RESTORE);
+        if (minimizedPreviousWindow || IsIconic(previousForeground))
+            ShowWindowAsync(previousForeground, SW_RESTORE);
         BringToForeground(previousForeground);
     }
     if (restoreClip) ClipCursor(&previousClip);
@@ -1034,6 +1232,140 @@ RegionSelection SelectRegion(HMONITOR monitor, const CaptureResult* preview = nu
         }
     }
     return selection;
+}
+
+struct CaptureNotificationState {
+    bool clipboardCopied = false;
+};
+
+LRESULT CALLBACK CaptureNotificationProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
+    auto* state = reinterpret_cast<CaptureNotificationState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    if (message == WM_NCCREATE) {
+        const auto* create = reinterpret_cast<CREATESTRUCTW*>(lParam);
+        state = static_cast<CaptureNotificationState*>(create->lpCreateParams);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(state));
+    }
+
+    switch (message) {
+    case WM_MOUSEACTIVATE:
+        return MA_NOACTIVATE;
+    case WM_NCHITTEST:
+        return HTTRANSPARENT;
+    case WM_TIMER:
+        if (wParam == kCaptureNotificationTimer) DestroyWindow(hwnd);
+        return 0;
+    case WM_PAINT: {
+        PAINTSTRUCT paint{};
+        HDC dc = BeginPaint(hwnd, &paint);
+        RECT client{};
+        GetClientRect(hwnd, &client);
+        const UINT dpi = GetDpiForWindow(hwnd);
+
+        HBRUSH background = CreateSolidBrush(RGB(28, 31, 36));
+        FillRect(dc, &client, background);
+        DeleteObject(background);
+
+        const int accentWidth = MulDiv(5, dpi, 96);
+        RECT accent{0, 0, accentWidth, client.bottom};
+        HBRUSH accentBrush = CreateSolidBrush(RGB(54, 201, 124));
+        FillRect(dc, &accent, accentBrush);
+
+        const int iconX = MulDiv(32, dpi, 96);
+        const int iconY = client.bottom / 2;
+        const int iconRadius = MulDiv(14, dpi, 96);
+        HGDIOBJ oldBrush = SelectObject(dc, accentBrush);
+        HGDIOBJ oldPen = SelectObject(dc, GetStockObject(NULL_PEN));
+        Ellipse(dc, iconX - iconRadius, iconY - iconRadius,
+                iconX + iconRadius, iconY + iconRadius);
+        SelectObject(dc, oldBrush);
+        SelectObject(dc, oldPen);
+        DeleteObject(accentBrush);
+
+        HPEN checkPen = CreatePen(PS_SOLID, std::max(2, MulDiv(2, dpi, 96)), RGB(255, 255, 255));
+        oldPen = SelectObject(dc, checkPen);
+        MoveToEx(dc, iconX - MulDiv(7, dpi, 96), iconY, nullptr);
+        LineTo(dc, iconX - MulDiv(2, dpi, 96), iconY + MulDiv(5, dpi, 96));
+        LineTo(dc, iconX + MulDiv(8, dpi, 96), iconY - MulDiv(6, dpi, 96));
+        SelectObject(dc, oldPen);
+        DeleteObject(checkPen);
+
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, RGB(255, 255, 255));
+        HFONT titleFont = CreateFontW(-MulDiv(16, dpi, 96), 0, 0, 0, FW_SEMIBOLD,
+                                     FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                                     OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                                     DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+        HFONT detailFont = CreateFontW(-MulDiv(12, dpi, 96), 0, 0, 0, FW_NORMAL,
+                                      FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                                      OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                                      DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+        const int textLeft = MulDiv(58, dpi, 96);
+        RECT titleRect{textLeft, MulDiv(13, dpi, 96), client.right - MulDiv(12, dpi, 96), client.bottom};
+        HGDIOBJ oldFont = SelectObject(dc, titleFont);
+        DrawTextW(dc, L"Captura creada", -1, &titleRect, DT_SINGLELINE | DT_NOPREFIX);
+
+        SetTextColor(dc, RGB(197, 203, 211));
+        RECT detailRect{textLeft, MulDiv(39, dpi, 96), client.right - MulDiv(12, dpi, 96), client.bottom};
+        SelectObject(dc, detailFont);
+        const wchar_t* detail = state && state->clipboardCopied
+            ? L"Guardada y copiada al portapapeles"
+            : L"Guardada; portapapeles no disponible";
+        DrawTextW(dc, detail, -1, &detailRect, DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+        SelectObject(dc, oldFont);
+        DeleteObject(titleFont);
+        DeleteObject(detailFont);
+        EndPaint(hwnd, &paint);
+        return 0;
+    }
+    case WM_NCDESTROY:
+        KillTimer(hwnd, kCaptureNotificationTimer);
+        delete state;
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+        return 0;
+    }
+    return DefWindowProcW(hwnd, message, wParam, lParam);
+}
+
+void ShowCaptureNotification(HMONITOR monitor, bool clipboardCopied) {
+    static bool classRegistered = false;
+    if (!classRegistered) {
+        WNDCLASSEXW wc{sizeof(wc)};
+        wc.lpfnWndProc = CaptureNotificationProc;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.lpszClassName = L"NativeHDRShot.CaptureNotification";
+        classRegistered = RegisterClassExW(&wc) != 0 || GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
+    }
+    if (!classRegistered) return;
+
+    MONITORINFO info{sizeof(info)};
+    if (!monitor || !GetMonitorInfoW(monitor, &info)) {
+        monitor = MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY);
+        if (!GetMonitorInfoW(monitor, &info)) return;
+    }
+
+    auto* state = new CaptureNotificationState{clipboardCopied};
+    HWND notification = CreateWindowExW(
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED,
+        L"NativeHDRShot.CaptureNotification", L"Captura creada", WS_POPUP,
+        0, 0, 0, 0, nullptr, nullptr, GetModuleHandleW(nullptr), state);
+    if (!notification) {
+        delete state;
+        return;
+    }
+
+    const UINT dpi = GetDpiForWindow(notification);
+    const int width = MulDiv(330, dpi, 96);
+    const int height = MulDiv(72, dpi, 96);
+    const int margin = MulDiv(18, dpi, 96);
+    const int x = info.rcWork.right - width - margin;
+    const int y = info.rcWork.top + margin;
+    HRGN region = CreateRoundRectRgn(0, 0, width + 1, height + 1,
+                                     MulDiv(14, dpi, 96), MulDiv(14, dpi, 96));
+    if (!SetWindowRgn(notification, region, FALSE)) DeleteObject(region);
+    SetLayeredWindowAttributes(notification, 0, 242, LWA_ALPHA);
+    SetWindowPos(notification, HWND_TOPMOST, x, y, width, height,
+                 SWP_SHOWWINDOW | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+    SetTimer(notification, kCaptureNotificationTimer, 2200, nullptr);
 }
 
 class App {
@@ -1062,7 +1394,8 @@ public:
         RecoverPrintScreenControl(false);
         Log(L"Inicio. Hook PrintScreen=" + std::wstring(HasPrintScreenControl() ? L"activo" : L"inactivo") +
             L", reserva RegisterHotKey=" + std::wstring(printScreenRegistered_ ? L"activa" : L"ocupada") +
-            L", Ctrl+Shift+F11=" + std::wstring(fallbackRegistered_ ? L"activo" : L"ocupado"));
+            L", Ctrl+Shift+F11=" + std::wstring(fallbackRegistered_ ? L"activo" : L"ocupado") +
+            L", integridad=" + std::wstring(IsProcessElevated() ? L"elevada" : L"estándar"));
         if (!HasPrintScreenControl()) {
             Notify(L"Impr Pant sin protección", printScreenRegistered_
                 ? L"La captura sigue disponible, pero Windows podría adelantarse. Usa «Recuperar Impr Pant» en Configuración."
@@ -1290,6 +1623,7 @@ private:
                 if (!result->clipboardCopied) Log(L"AVISO portapapeles: " + result->clipboardError);
                 Notify(result->clipboardCopied ? L"Captura completada" : L"Captura guardada",
                        messageText.str(), result->clipboardCopied ? NIIF_INFO : NIIF_WARNING);
+                ShowCaptureNotification(previewMonitor_, result->clipboardCopied);
             } else {
                 Log(L"ERROR: " + result->error);
                 Notify(L"No se pudo capturar", result->error, NIIF_ERROR);
@@ -1311,14 +1645,23 @@ private:
             Notify(L"Captura en curso", L"Espera a que termine la captura anterior.", NIIF_INFO);
             return;
         }
-        previewMonitor_ = MonitorUnderCursor();
-        Log(L"Capturando fotograma previo para el selector");
+        bool usedFullscreenWindow = false;
+        previewMonitor_ = CaptureTargetMonitor(usedFullscreenWindow);
+        MONITORINFO monitorInfo{sizeof(monitorInfo)};
+        GetMonitorInfoW(previewMonitor_, &monitorInfo);
+        std::wostringstream targetMessage;
+        targetMessage << L"Preparando selector multimonitor; referencia "
+                      << monitorInfo.rcMonitor.left << L',' << monitorInfo.rcMonitor.top << L' '
+                      << monitorInfo.rcMonitor.right - monitorInfo.rcMonitor.left << L'x'
+                      << monitorInfo.rcMonitor.bottom - monitorInfo.rcMonitor.top
+                      << (usedFullscreenWindow ? L" (ventana a pantalla completa)" : L" (cursor)");
+        Log(targetMessage.str());
         const CaptureSettings settings = settings_;
         const HMONITOR monitor = previewMonitor_;
         std::thread([this, monitor, settings] {
             init_apartment(apartment_type::multi_threaded);
             auto result = std::make_unique<CaptureResult>(
-                CaptureMonitor(monitor, settings, nullptr, nullptr, true));
+                CaptureVirtualDesktop(settings, monitor));
             PostMessageW(hwnd_, kPreviewReady, 0, reinterpret_cast<LPARAM>(result.release()));
         }).detach();
     }
