@@ -2,6 +2,14 @@
 
 Todas las modificaciones relevantes se documentarán en este archivo.
 
+## 0.2.0 - 2026-08-11
+
+- Intercepción nativa de `Impr Pant` mediante `WH_KEYBOARD_LL`.
+- Reserva paralela con `RegisterHotKey` para detectar y cubrir la pérdida del hook.
+- Estado de protección en el icono de bandeja, el menú y Configuración.
+- Botón para recuperar o renovar el control de `Impr Pant` sin reiniciar.
+- Atajo alternativo cambiado a `Ctrl + Mayús + F11`; `F12` está reservado por Windows para depuradores.
+
 ## 0.1.0 - 2026-08-11
 
 Primera versión pública.

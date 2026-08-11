@@ -3,12 +3,13 @@
 ## `Impr Pant` no abre el selector
 
 1. Comprueba que el icono de NativeHDRShot está en el área de notificación.
-2. Prueba `Ctrl + Mayús + F12`.
-3. Cierra otras herramientas de captura que usen `Impr Pant`.
-4. En Windows, revisa **Configuración → Accesibilidad → Teclado → Usar el botón Impr Pant para abrir Recortes de pantalla**.
-5. Reinicia NativeHDRShot desde `%LOCALAPPDATA%\NativeHDRShot\NativeHDRShot.exe`.
+2. Abre **Configuración** y revisa el estado de `Impr Pant`. Si aparece sin protección, pulsa **Recuperar Impr Pant**.
+3. Prueba `Ctrl + Mayús + F11`.
+4. Cierra otras herramientas de captura que usen `Impr Pant`.
+5. En Windows, revisa **Configuración → Accesibilidad → Teclado → Usar el botón Impr Pant para abrir Recortes de pantalla**.
+6. Reinicia NativeHDRShot desde `%LOCALAPPDATA%\NativeHDRShot\NativeHDRShot.exe`.
 
-Al arrancar, el registro indica si cada atajo quedó `activo` u `ocupado`.
+El icono normal indica que el hook nativo protege `Impr Pant`. Un icono de advertencia indica que el hook no está activo; NativeHDRShot intentará mantener la captura mediante la reserva del atajo. Al arrancar, el registro indica el estado del hook, la reserva y el atajo alternativo.
 
 ## El selector aparece en otro monitor
 

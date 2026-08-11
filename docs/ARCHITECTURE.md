@@ -7,7 +7,7 @@ Windows compone el escritorio HDR en scRGB lineal. Una captura directa a 8 bits 
 ## Flujo de captura
 
 ```text
-Impr Pant / Ctrl+Mayús+F12
+Impr Pant (hook nativo) / Ctrl+Mayús+F11
           │
           ▼
 Selección Win32 de región
@@ -34,7 +34,9 @@ Compresión suave de luces HDR + conversión sRGB
 
 ### Ventana residente
 
-Una ventana Win32 de solo mensajes registra los atajos globales, gestiona el icono del área de notificación y recibe el resultado de los trabajos de captura.
+Una ventana Win32 de solo mensajes gestiona el icono del área de notificación y recibe el resultado de los trabajos de captura. Un hook `WH_KEYBOARD_LL` intercepta `Impr Pant` sin bloquear el hilo dentro del callback: únicamente publica un mensaje privado a la ventana y devuelve inmediatamente.
+
+`RegisterHotKey` mantiene en paralelo una reserva de `Impr Pant`. Si Windows retira silenciosamente el hook y la reserva recibe la siguiente pulsación, la aplicación continúa capturando, cambia el icono a advertencia y ofrece reinstalar el hook desde Configuración. Las combinaciones modificadas como `Alt + Impr Pant` y `Win + Impr Pant` se dejan pasar a Windows.
 
 ### Selector de región
 

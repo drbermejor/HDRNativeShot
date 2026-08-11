@@ -15,7 +15,10 @@ NativeHDRShot utiliza Windows Graphics Capture y Direct3D 11. La captura se real
 ## Características
 
 - Captura de región mediante `Impr Pant`.
-- Atajo alternativo `Ctrl + Mayús + F12`.
+- Hook de teclado nativo que intercepta `Impr Pant` antes que Recortes.
+- Reserva paralela del atajo para mantener la captura si Windows retira el hook.
+- Estado de protección visible en el icono y recuperación manual desde Configuración.
+- Atajo alternativo `Ctrl + Mayús + F11`.
 - Selección limpia: cursor en cruz y marco, sin animaciones ni carteles.
 - `Enter` captura el monitor completo y `Esc` cancela.
 - PNG sin pérdida o JPEG con calidad configurable entre 50 y 100 %.
@@ -50,7 +53,7 @@ La suma SHA-256 del binario se publica en [`dist/SHA256SUMS.txt`](dist/SHA256SUM
 ## Uso
 
 1. Coloca el cursor en el monitor que quieres capturar.
-2. Pulsa `Impr Pant` o `Ctrl + Mayús + F12`.
+2. Pulsa `Impr Pant` o `Ctrl + Mayús + F11`.
 3. Arrastra el cursor para marcar la región.
 
 Durante la selección:
@@ -73,6 +76,8 @@ Haz clic derecho en el icono del área de notificación y abre `Configuración�
 
 - **PNG — máxima calidad:** formato predeterminado y sin pérdida.
 - **JPEG — archivo más pequeño:** permite ajustar la calidad entre 50 y 100 %.
+- **Impr Pant protegido:** el icono normal indica que el hook nativo está activo.
+- **Impr Pant sin protección:** el icono de advertencia indica que queda únicamente la reserva del atajo; usa el botón **Recuperar Impr Pant**.
 
 La configuración se guarda en `HKCU\Software\NativeHDRShot` y permanece después de reiniciar.
 

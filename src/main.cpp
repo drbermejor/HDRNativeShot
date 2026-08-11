@@ -47,15 +47,19 @@ constexpr wchar_t kAppName[] = L"NativeHDRShot";
 constexpr wchar_t kWindowClass[] = L"NativeHDRShot.HiddenWindow";
 constexpr UINT kTrayMessage = WM_APP + 1;
 constexpr UINT kCaptureDone = WM_APP + 2;
+constexpr UINT kHookCaptureRequested = WM_APP + 3;
 constexpr UINT kMenuCapture = 100;
 constexpr UINT kMenuOpenFolder = 101;
 constexpr UINT kMenuSettings = 102;
 constexpr UINT kMenuExit = 103;
+constexpr UINT kMenuRecoverPrintScreen = 104;
 constexpr UINT kSettingsFormat = 200;
 constexpr UINT kSettingsQuality = 201;
 constexpr UINT kSettingsQualityValue = 202;
 constexpr UINT kSettingsSave = 203;
 constexpr UINT kSettingsCancel = 204;
+constexpr UINT kSettingsPrintScreenStatus = 205;
+constexpr UINT kSettingsRecoverPrintScreen = 206;
 constexpr int kHotkeyPrintScreen = 1;
 constexpr int kHotkeyFallback = 2;
 
@@ -709,6 +713,7 @@ public:
         instance_ = instance;
         appIcon_ = LoadIconW(instance, MAKEINTRESOURCEW(IDI_APP_ICON));
         if (!appIcon_) appIcon_ = LoadIconW(nullptr, IDI_APPLICATION);
+        warningIcon_ = LoadIconW(nullptr, IDI_WARNING);
         const UINT taskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
         taskbarCreated_ = taskbarCreated;
         WNDCLASSEXW wc{sizeof(wc)};
@@ -723,15 +728,18 @@ public:
         check_bool(hwnd_ != nullptr);
         AddTrayIcon();
 
-        printScreenRegistered_ = RegisterHotKey(hwnd_, kHotkeyPrintScreen, MOD_NOREPEAT, VK_SNAPSHOT) != FALSE;
         fallbackRegistered_ = RegisterHotKey(hwnd_, kHotkeyFallback,
-                                             MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, VK_F12) != FALSE;
-        Log(L"Inicio. PrintScreen=" + std::wstring(printScreenRegistered_ ? L"activo" : L"ocupado") +
-            L", Ctrl+Shift+F12=" + std::wstring(fallbackRegistered_ ? L"activo" : L"ocupado"));
-        if (!printScreenRegistered_) {
-            Notify(L"PrintScreen está ocupado", fallbackRegistered_
-                ? L"Usa Ctrl+Shift+F12. Puedes desactivar «Usar Impr Pant para abrir Recortes» en Configuración."
-                : L"También está ocupado Ctrl+Shift+F12; revisa otras aplicaciones de captura.", NIIF_WARNING);
+                                             MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, VK_F11) != FALSE;
+        RecoverPrintScreenControl(false);
+        Log(L"Inicio. Hook PrintScreen=" + std::wstring(HasPrintScreenControl() ? L"activo" : L"inactivo") +
+            L", reserva RegisterHotKey=" + std::wstring(printScreenRegistered_ ? L"activa" : L"ocupada") +
+            L", Ctrl+Shift+F11=" + std::wstring(fallbackRegistered_ ? L"activo" : L"ocupado"));
+        if (!HasPrintScreenControl()) {
+            Notify(L"Impr Pant sin protección", printScreenRegistered_
+                ? L"La captura sigue disponible, pero Windows podría adelantarse. Usa «Recuperar Impr Pant» en Configuración."
+                : (fallbackRegistered_
+                    ? L"Usa Ctrl+Shift+F11 y pulsa «Recuperar Impr Pant» en Configuración."
+                    : L"Los atajos están ocupados; pulsa «Recuperar Impr Pant» en Configuración."), NIIF_WARNING);
         }
 
         MSG message{};
@@ -755,6 +763,12 @@ private:
         const int quality = static_cast<int>(SendMessageW(slider, TBM_GETPOS, 0, 0));
         std::wstring label = jpeg ? std::to_wstring(quality) + L" %" : L"Sin pérdida";
         SetWindowTextW(value, label.c_str());
+
+        const HWND status = GetDlgItem(window, kSettingsPrintScreenStatus);
+        if (status) SetWindowTextW(status, self->PrintScreenStatusText().c_str());
+        const HWND recover = GetDlgItem(window, kSettingsRecoverPrintScreen);
+        if (recover) SetWindowTextW(recover,
+            self->HasPrintScreenControl() ? L"Renovar control de Impr Pant" : L"Recuperar Impr Pant");
     }
 
     static LRESULT CALLBACK SettingsWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
@@ -797,15 +811,23 @@ private:
             SendMessageW(slider, TBM_SETPOS, TRUE, self->settings_.jpegQuality);
             createControl(L"STATIC", L"", SS_CENTER, 335, 78, 55, 24, kSettingsQualityValue);
 
+            createControl(L"STATIC", L"Impr Pant", 0, 24, 126, 110, 24, 0);
+            createControl(L"STATIC", L"", SS_LEFT, 145, 126, 235, 24, kSettingsPrintScreenStatus);
+            createControl(L"BUTTON", L"Recuperar Impr Pant", BS_PUSHBUTTON | WS_TABSTOP,
+                          145, 155, 235, 32, kSettingsRecoverPrintScreen);
+
             createControl(L"BUTTON", L"Guardar", BS_DEFPUSHBUTTON | WS_TABSTOP,
-                          205, 140, 86, 32, kSettingsSave);
+                          205, 215, 86, 32, kSettingsSave);
             createControl(L"BUTTON", L"Cancelar", BS_PUSHBUTTON | WS_TABSTOP,
-                          300, 140, 86, 32, kSettingsCancel);
+                          300, 215, 86, 32, kSettingsCancel);
             UpdateSettingsControls(window);
             return 0;
         }
         case WM_COMMAND:
             if (LOWORD(wParam) == kSettingsFormat && HIWORD(wParam) == CBN_SELCHANGE) {
+                UpdateSettingsControls(window);
+            } else if (LOWORD(wParam) == kSettingsRecoverPrintScreen) {
+                self->RecoverPrintScreenControl(true);
                 UpdateSettingsControls(window);
             } else if (LOWORD(wParam) == kSettingsSave) {
                 CaptureSettings updated;
@@ -864,7 +886,21 @@ private:
             return 0;
         }
         switch (message) {
+        case kHookCaptureRequested:
+            StartCapture();
+            return 0;
         case WM_HOTKEY:
+            if (static_cast<int>(wParam) == kHotkeyPrintScreen && keyboardHook_) {
+                UnhookWindowsHookEx(keyboardHook_);
+                keyboardHook_ = nullptr;
+                printScreenKeyDown_ = false;
+                Log(L"AVISO: el hook de Impr Pant dejó de interceptar; se mantiene la reserva del atajo");
+                UpdateTrayStatus();
+                Notify(L"Impr Pant sin protección",
+                       L"La captura funciona mediante reserva, pero Windows podría adelantarse. Usa «Recuperar Impr Pant».",
+                       NIIF_WARNING);
+                UpdateSettingsControls(settingsWindow_);
+            }
             StartCapture();
             return 0;
         case WM_COMMAND:
@@ -875,6 +911,8 @@ private:
                 ShellExecuteW(nullptr, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
             } else if (LOWORD(wParam) == kMenuSettings) {
                 ShowSettings();
+            } else if (LOWORD(wParam) == kMenuRecoverPrintScreen) {
+                RecoverPrintScreenControl(true);
             } else if (LOWORD(wParam) == kMenuExit) {
                 DestroyWindow(hwnd_);
             }
@@ -900,6 +938,7 @@ private:
             return 0;
         }
         case WM_DESTROY:
+            ReleasePrintScreenControl();
             UnregisterHotKey(hwnd_, kHotkeyPrintScreen);
             UnregisterHotKey(hwnd_, kHotkeyFallback);
             PostQuitMessage(0);
@@ -937,8 +976,8 @@ private:
         tray_.uID = 1;
         tray_.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
         tray_.uCallbackMessage = kTrayMessage;
-        tray_.hIcon = appIcon_;
-        wcscpy_s(tray_.szTip, kAppName);
+        tray_.hIcon = HasPrintScreenControl() ? appIcon_ : warningIcon_;
+        wcsncpy_s(tray_.szTip, TrayTooltip().c_str(), _TRUNCATE);
         Shell_NotifyIconW(NIM_ADD, &tray_);
         tray_.uVersion = NOTIFYICON_VERSION_4;
         Shell_NotifyIconW(NIM_SETVERSION, &tray_);
@@ -956,6 +995,101 @@ private:
         Shell_NotifyIconW(NIM_MODIFY, &tray_);
     }
 
+    bool HasPrintScreenControl() const noexcept {
+        return keyboardHook_ != nullptr;
+    }
+
+    std::wstring PrintScreenStatusText() const {
+        if (HasPrintScreenControl()) return L"Protegido por hook nativo";
+        if (printScreenRegistered_) return L"Reserva activa; sin protección";
+        return L"No disponible";
+    }
+
+    std::wstring TrayTooltip() const {
+        if (HasPrintScreenControl()) return L"NativeHDRShot — Impr Pant protegido";
+        if (printScreenRegistered_) return L"NativeHDRShot — Impr Pant sin protección";
+        return L"NativeHDRShot — Impr Pant no disponible";
+    }
+
+    void UpdateTrayStatus() {
+        if (!hwnd_) return;
+        tray_.uFlags = NIF_ICON | NIF_TIP | NIF_SHOWTIP;
+        tray_.hIcon = HasPrintScreenControl() ? appIcon_ : warningIcon_;
+        wcsncpy_s(tray_.szTip, TrayTooltip().c_str(), _TRUNCATE);
+        Shell_NotifyIconW(NIM_MODIFY, &tray_);
+    }
+
+    void ReleasePrintScreenControl() noexcept {
+        if (keyboardHook_) {
+            UnhookWindowsHookEx(keyboardHook_);
+            keyboardHook_ = nullptr;
+        }
+        if (hookOwner_ == this) hookOwner_ = nullptr;
+        printScreenKeyDown_ = false;
+    }
+
+    bool RecoverPrintScreenControl(bool showResult) {
+        ReleasePrintScreenControl();
+        if (printScreenRegistered_) {
+            UnregisterHotKey(hwnd_, kHotkeyPrintScreen);
+            printScreenRegistered_ = false;
+        }
+
+        hookOwner_ = this;
+        keyboardHook_ = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc, instance_, 0);
+        if (!keyboardHook_) {
+            hookOwner_ = nullptr;
+            Log(L"ERROR instalando hook de Impr Pant: " + HResultText(HRESULT_FROM_WIN32(GetLastError())));
+        } else {
+            Log(L"Hook nativo de Impr Pant instalado");
+        }
+
+        // This reservation keeps capture working if Windows silently removes the hook.
+        printScreenRegistered_ = RegisterHotKey(hwnd_, kHotkeyPrintScreen, MOD_NOREPEAT, VK_SNAPSHOT) != FALSE;
+        UpdateTrayStatus();
+        UpdateSettingsControls(settingsWindow_);
+
+        if (showResult) {
+            if (HasPrintScreenControl()) {
+                Notify(L"Impr Pant recuperado", L"NativeHDRShot vuelve a interceptar y proteger la tecla.", NIIF_INFO);
+            } else {
+                Notify(L"No se pudo recuperar Impr Pant",
+                       printScreenRegistered_
+                           ? L"La reserva funciona, pero Windows todavía podría adelantarse."
+                           : L"Otra aplicación mantiene ocupado el atajo. Cierra el otro capturador e inténtalo de nuevo.",
+                       NIIF_WARNING);
+            }
+        }
+        return HasPrintScreenControl();
+    }
+
+    static bool HasPrintScreenModifiers() noexcept {
+        return (GetAsyncKeyState(VK_MENU) & 0x8000) != 0 ||
+               (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0 ||
+               (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0 ||
+               (GetAsyncKeyState(VK_LWIN) & 0x8000) != 0 ||
+               (GetAsyncKeyState(VK_RWIN) & 0x8000) != 0;
+    }
+
+    static LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM wParam, LPARAM lParam) {
+        App* self = hookOwner_;
+        if (code == HC_ACTION && self) {
+            const auto* event = reinterpret_cast<const KBDLLHOOKSTRUCT*>(lParam);
+            if (event->vkCode == VK_SNAPSHOT) {
+                const bool keyDown = wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN;
+                const bool keyUp = wParam == WM_KEYUP || wParam == WM_SYSKEYUP;
+                if (keyDown && !HasPrintScreenModifiers()) {
+                    if (!self->printScreenKeyDown_.exchange(true)) {
+                        PostMessageW(self->hwnd_, kHookCaptureRequested, 0, 0);
+                    }
+                    return 1;
+                }
+                if (keyUp && self->printScreenKeyDown_.exchange(false)) return 1;
+            }
+        }
+        return CallNextHookEx(nullptr, code, wParam, lParam);
+    }
+
     void ShowTrayMenu() {
         POINT point{};
         GetCursorPos(&point);
@@ -963,6 +1097,11 @@ private:
         AppendMenuW(menu, MF_STRING, kMenuCapture, L"Capturar región");
         AppendMenuW(menu, MF_STRING, kMenuOpenFolder, L"Abrir carpeta de capturas");
         AppendMenuW(menu, MF_STRING, kMenuSettings, L"Configuración…");
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, PrintScreenStatusText().c_str());
+        if (!HasPrintScreenControl()) {
+            AppendMenuW(menu, MF_STRING, kMenuRecoverPrintScreen, L"Recuperar Impr Pant");
+        }
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(menu, MF_STRING, kMenuExit, L"Salir");
         SetForegroundWindow(hwnd_);
@@ -994,7 +1133,7 @@ private:
             return;
         }
 
-        RECT desired{0, 0, 420, 220};
+        RECT desired{0, 0, 420, 285};
         AdjustWindowRectEx(&desired, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, FALSE,
                            WS_EX_DLGMODALFRAME);
         const int width = desired.right - desired.left;
@@ -1019,12 +1158,16 @@ private:
     HWND hwnd_ = nullptr;
     HWND settingsWindow_ = nullptr;
     HICON appIcon_ = nullptr;
+    HICON warningIcon_ = nullptr;
+    HHOOK keyboardHook_ = nullptr;
     NOTIFYICONDATAW tray_{};
     UINT taskbarCreated_ = 0;
     bool printScreenRegistered_ = false;
     bool fallbackRegistered_ = false;
     CaptureSettings settings_ = LoadSettings();
     std::atomic<bool> captureActive_{false};
+    std::atomic<bool> printScreenKeyDown_{false};
+    inline static App* hookOwner_ = nullptr;
 };
 
 bool HasArgument(PCWSTR wanted) {
