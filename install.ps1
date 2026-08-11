@@ -16,10 +16,24 @@ $destination = Join-Path $installDirectory 'NativeHDRShot.exe'
 New-Item -ItemType Directory -Path $installDirectory -Force | Out-Null
 $runningInstances = Get-Process -Name NativeHDRShot -ErrorAction SilentlyContinue
 if ($runningInstances) {
-    $runningInstances | Stop-Process
-    $runningInstances | Wait-Process -Timeout 5 -ErrorAction SilentlyContinue
+    $runningInstances | Stop-Process -Force
+    $runningInstances | Wait-Process -Timeout 10 -ErrorAction SilentlyContinue
 }
-Copy-Item -LiteralPath $source -Destination $destination -Force
+
+$copySucceeded = $false
+$copyError = $null
+for ($attempt = 1; $attempt -le 20 -and -not $copySucceeded; $attempt++) {
+    try {
+        Copy-Item -LiteralPath $source -Destination $destination -Force
+        $copySucceeded = $true
+    } catch {
+        $copyError = $_
+        Start-Sleep -Milliseconds 150
+    }
+}
+if (-not $copySucceeded) {
+    throw $copyError
+}
 
 $startupDirectory = [Environment]::GetFolderPath('Startup')
 $shortcutPath = Join-Path $startupDirectory 'NativeHDRShot.lnk'

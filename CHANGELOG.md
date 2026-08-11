@@ -2,6 +2,14 @@
 
 Todas las modificaciones relevantes se documentarán en este archivo.
 
+## 0.3.0 - 2026-08-11
+
+- Copia automática de cada captura SDR al portapapeles mediante `CF_DIBV5`.
+- Compatibilidad de pegado mediante las conversiones de bitmap proporcionadas por Windows.
+- Reintentos breves cuando otra aplicación mantiene abierto el portapapeles.
+- El archivo se conserva y se muestra una advertencia si la copia al portapapeles falla.
+- El instalador espera y reintenta el reemplazo si Windows tarda en liberar el ejecutable anterior.
+
 ## 0.2.0 - 2026-08-11
 
 - Intercepción nativa de `Impr Pant` mediante `WH_KEYBOARD_LL`.

@@ -4,8 +4,8 @@
 IDI_APP_ICON ICON "assets\\NativeHDRShot.ico"
 
 IDR_VERSION_INFO VERSIONINFO
- FILEVERSION 0,2,0,0
- PRODUCTVERSION 0,2,0,0
+ FILEVERSION 0,3,0,0
+ PRODUCTVERSION 0,3,0,0
  FILEFLAGSMASK 0x3fL
 #ifdef _DEBUG
  FILEFLAGS 0x1L
@@ -22,12 +22,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "drbermejor"
             VALUE "FileDescription", "Captura HDR nativa a SDR"
-            VALUE "FileVersion", "0.2.0"
+            VALUE "FileVersion", "0.3.0"
             VALUE "InternalName", "NativeHDRShot"
             VALUE "LegalCopyright", "Copyright (C) 2026 drbermejor"
             VALUE "OriginalFilename", "NativeHDRShot.exe"
             VALUE "ProductName", "NativeHDRShot"
-            VALUE "ProductVersion", "0.2.0"
+            VALUE "ProductVersion", "0.3.0"
         END
     END
     BLOCK "VarFileInfo"

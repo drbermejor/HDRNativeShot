@@ -25,9 +25,11 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -75,8 +77,10 @@ struct CaptureSettings {
 
 struct CaptureResult {
     bool ok = false;
+    bool clipboardCopied = false;
     std::filesystem::path sdrPath;
     std::wstring error;
+    std::wstring clipboardError;
     float peakLinear = 0.0f;
     float sdrWhiteMultiplier = 1.0f;
 };
@@ -392,8 +396,91 @@ CapturedTexture CaptureTexture(HMONITOR monitor) {
 
 float SdrWhiteLevelMultiplier(HMONITOR monitor) noexcept;
 
+bool CopySdrToClipboard(HWND owner, UINT width, UINT height, UINT stride,
+                        const BYTE* pixels, std::wstring& error) noexcept {
+    if (!owner || !IsWindow(owner)) {
+        error = L"No hay una ventana válida para controlar el portapapeles";
+        return false;
+    }
+    if (!pixels || width == 0 || height == 0 ||
+        width > static_cast<UINT>(std::numeric_limits<LONG>::max()) ||
+        height > static_cast<UINT>(std::numeric_limits<LONG>::max())) {
+        error = L"La imagen no tiene dimensiones válidas para el portapapeles";
+        return false;
+    }
+
+    const size_t pixelBytes = static_cast<size_t>(stride) * height;
+    if (pixelBytes > std::numeric_limits<DWORD>::max() ||
+        pixelBytes > std::numeric_limits<size_t>::max() - sizeof(BITMAPV5HEADER)) {
+        error = L"La imagen es demasiado grande para el portapapeles";
+        return false;
+    }
+
+    const size_t allocationSize = sizeof(BITMAPV5HEADER) + pixelBytes;
+    HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, allocationSize);
+    if (!memory) {
+        error = L"No se pudo reservar memoria para el portapapeles";
+        return false;
+    }
+
+    void* locked = GlobalLock(memory);
+    if (!locked) {
+        GlobalFree(memory);
+        error = L"No se pudo preparar la imagen para el portapapeles";
+        return false;
+    }
+
+    BITMAPV5HEADER header{};
+    header.bV5Size = sizeof(header);
+    header.bV5Width = static_cast<LONG>(width);
+    header.bV5Height = -static_cast<LONG>(height);
+    header.bV5Planes = 1;
+    header.bV5BitCount = 32;
+    header.bV5Compression = BI_BITFIELDS;
+    header.bV5SizeImage = static_cast<DWORD>(pixelBytes);
+    header.bV5RedMask = 0x00FF0000;
+    header.bV5GreenMask = 0x0000FF00;
+    header.bV5BlueMask = 0x000000FF;
+    header.bV5AlphaMask = 0xFF000000;
+    header.bV5CSType = LCS_sRGB;
+    header.bV5Intent = LCS_GM_IMAGES;
+    std::memcpy(locked, &header, sizeof(header));
+    std::memcpy(static_cast<BYTE*>(locked) + sizeof(header), pixels, pixelBytes);
+    GlobalUnlock(memory);
+
+    bool opened = false;
+    for (int attempt = 0; attempt < 10 && !opened; ++attempt) {
+        opened = OpenClipboard(owner) != FALSE;
+        if (!opened) std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
+    if (!opened) {
+        GlobalFree(memory);
+        error = L"Otra aplicación mantiene ocupado el portapapeles";
+        return false;
+    }
+
+    if (!EmptyClipboard()) {
+        const HRESULT failure = HRESULT_FROM_WIN32(GetLastError());
+        CloseClipboard();
+        GlobalFree(memory);
+        error = L"No se pudo vaciar el portapapeles: " + HResultText(failure);
+        return false;
+    }
+    if (!SetClipboardData(CF_DIBV5, memory)) {
+        const HRESULT failure = HRESULT_FROM_WIN32(GetLastError());
+        CloseClipboard();
+        GlobalFree(memory);
+        error = L"No se pudo copiar la imagen: " + HResultText(failure);
+        return false;
+    }
+
+    CloseClipboard();
+    return true;
+}
+
 CaptureResult CaptureMonitor(HMONITOR monitor, const CaptureSettings& settings,
-                             const RECT* requestedRegion = nullptr) {
+                             const RECT* requestedRegion = nullptr,
+                             HWND clipboardOwner = nullptr) {
     CaptureResult result;
     try {
         result.sdrWhiteMultiplier = SdrWhiteLevelMultiplier(monitor);
@@ -495,6 +582,9 @@ CaptureResult CaptureMonitor(HMONITOR monitor, const CaptureSettings& settings,
                     outputWidth, outputHeight, jpegStride, jpegPixels.data(),
                     static_cast<UINT>(jpegPixels.size()), settings.jpegQuality / 100.0f);
         }
+        result.clipboardCopied = CopySdrToClipboard(
+            clipboardOwner, outputWidth, outputHeight, sdrStride,
+            sdrPixels.data(), result.clipboardError);
         result.ok = true;
     } catch (const hresult_error& error) {
         result.error = error.message() + L": " + HResultText(error.code());
@@ -928,9 +1018,12 @@ private:
                 std::wostringstream messageText;
                 messageText << L"Guardado: " << result->sdrPath.filename().wstring()
                             << L" (pico SDR " << std::fixed << std::setprecision(2) << result->peakLinear
-                            << L", blanco SDR x" << result->sdrWhiteMultiplier << L")";
+                            << L", blanco SDR x" << result->sdrWhiteMultiplier << L")"
+                            << (result->clipboardCopied ? L" · copiada al portapapeles" : L" · sin portapapeles");
                 Log(messageText.str());
-                Notify(L"Captura completada", messageText.str(), NIIF_INFO);
+                if (!result->clipboardCopied) Log(L"AVISO portapapeles: " + result->clipboardError);
+                Notify(result->clipboardCopied ? L"Captura completada" : L"Captura guardada",
+                       messageText.str(), result->clipboardCopied ? NIIF_INFO : NIIF_WARNING);
             } else {
                 Log(L"ERROR: " + result->error);
                 Notify(L"No se pudo capturar", result->error, NIIF_ERROR);
@@ -964,7 +1057,7 @@ private:
             init_apartment(apartment_type::multi_threaded);
             std::this_thread::sleep_for(std::chrono::milliseconds(80));
             auto result = std::make_unique<CaptureResult>(
-                CaptureMonitor(selection.monitor, settings, &selection.region));
+                CaptureMonitor(selection.monitor, settings, &selection.region, hwnd_));
             PostMessageW(hwnd_, kCaptureDone, 0, reinterpret_cast<LPARAM>(result.release()));
         }).detach();
     }
@@ -1191,9 +1284,15 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         const bool alreadyRunning = mutex && GetLastError() == ERROR_ALREADY_EXISTS;
         const bool captureOnce = HasArgument(L"--capture") || HasArgument(L"--capture-silent");
         if (captureOnce) {
-            const auto result = CaptureMonitor(MonitorUnderCursor(), LoadSettings());
+            HWND clipboardOwner = CreateWindowExW(
+                WS_EX_TOOLWINDOW, L"STATIC", kAppName, WS_POPUP,
+                0, 0, 0, 0, nullptr, nullptr, instance, nullptr);
+            const auto result = CaptureMonitor(MonitorUnderCursor(), LoadSettings(), nullptr, clipboardOwner);
+            if (clipboardOwner) DestroyWindow(clipboardOwner);
             if (result.ok) {
-                Log(L"Captura puntual guardada: " + result.sdrPath.wstring());
+                Log(L"Captura puntual guardada: " + result.sdrPath.wstring() +
+                    (result.clipboardCopied ? L" · copiada al portapapeles" : L" · sin portapapeles"));
+                if (!result.clipboardCopied) Log(L"AVISO portapapeles: " + result.clipboardError);
             } else {
                 Log(L"ERROR en captura puntual: " + result.error);
             }

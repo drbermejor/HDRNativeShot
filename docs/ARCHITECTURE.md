@@ -27,7 +27,8 @@ DISPLAYCONFIG_SDR_WHITE_LEVEL
 Compresión suave de luces HDR + conversión sRGB
           │
           ├── PNG BGRA 8 bits, sin pérdida
-          └── JPEG BGR 8 bits, calidad configurable
+          ├── JPEG BGR 8 bits, calidad configurable
+          └── Portapapeles CF_DIBV5 (sRGB)
 ```
 
 ## Componentes
@@ -53,6 +54,10 @@ Los objetos D3D y la sesión se recrean en cada operación. Esto añade un coste
 `DISPLAYCONFIG_SDR_WHITE_LEVEL` informa del multiplicador con el que Windows representa el blanco SDR dentro del espacio scRGB del monitor HDR. Los canales se normalizan por este valor antes de aplicar una curva de compresión suave a las luces que todavía superan el rango SDR.
 
 La conversión de lineal a sRGB utiliza la función de transferencia estándar por canal. Se conserva la relación entre canales durante la compresión de luminancia para reducir cambios de tono.
+
+### Portapapeles
+
+Después de guardar el archivo, el mismo búfer SDR BGRA se publica como `CF_DIBV5`, con perfil `LCS_sRGB` y alfa opaco. La memoria se reserva con `GMEM_MOVEABLE` y Windows toma su propiedad cuando `SetClipboardData` termina correctamente. Si el portapapeles está ocupado se realizan varios reintentos cortos; un fallo no elimina ni invalida el archivo guardado.
 
 ### Codificación
 

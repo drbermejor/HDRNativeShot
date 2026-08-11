@@ -22,6 +22,7 @@ NativeHDRShot utiliza Windows Graphics Capture y Direct3D 11. La captura se real
 - Selección limpia: cursor en cruz y marco, sin animaciones ni carteles.
 - `Enter` captura el monitor completo y `Esc` cancela.
 - PNG sin pérdida o JPEG con calidad configurable entre 50 y 100 %.
+- Copia automática de la captura SDR al portapapeles de Windows.
 - Selecciona automáticamente el monitor situado bajo el cursor.
 - Compatible con escalado DPI y configuraciones multimonitor.
 - Reinicializa D3D en cada captura para recuperarse de suspensión, cambios de pantalla o reinicios del controlador.
@@ -69,6 +70,8 @@ Las imágenes se guardan por mes en:
 ```text
 %USERPROFILE%\Pictures\NativeHDRShot\AAAA-MM
 ```
+
+La misma imagen SDR queda disponible en el portapapeles para pegarla directamente con `Ctrl + V`. NativeHDRShot usa el formato nativo `CF_DIBV5`; Windows puede convertirlo automáticamente para aplicaciones que soliciten `CF_DIB` o `CF_BITMAP`.
 
 ## Configuración de calidad
 

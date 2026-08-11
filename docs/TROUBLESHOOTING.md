@@ -29,6 +29,10 @@ Comprueba:
 
 La aplicación necesita permiso de escritura en la carpeta `Imágenes`. También puede fallar al capturar escritorios seguros, pantallas UAC, vídeo protegido por DRM o contenido excluido explícitamente de la captura.
 
+## La captura no se puede pegar
+
+NativeHDRShot muestra «sin portapapeles» y conserva el archivo si otra aplicación mantiene bloqueado el portapapeles durante todos los reintentos. Prueba de nuevo y consulta `NativeHDRShot.log`; una captura correcta queda publicada como `CF_DIBV5` y Windows proporciona conversiones para aplicaciones compatibles con otros formatos de bitmap.
+
 ## El icono no aparece después de actualizar
 
 Finaliza cualquier instancia antigua y vuelve a ejecutar `install.cmd`. El instalador espera a que el proceso termine, reemplaza el ejecutable y recrea el acceso directo con el icono incrustado.
