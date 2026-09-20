@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup><TestTargetName>NativeHDRShot.Capture.Tests</TestTargetName></PropertyGroup>
+  <Import Project="tests.vcxproj" />
+  <ItemDefinitionGroup><Link>
+    <AdditionalDependencies>d3d11.lib;dxgi.lib;shell32.lib;advapi32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+  </Link></ItemDefinitionGroup>
+  <ItemGroup><ClCompile Remove="image_tests.cpp" /><ClCompile Include="capture_tests.cpp" /></ItemGroup>
+</Project>

@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.5.0-beta.1 - 2026-09-20
+
+- Perfiles Ligera, Equilibrada y Máxima; tamaño máximo proporcional de 1280 a 3840 px u original.
+- Calidad JPEG de 30 a 100 y detalle de color 4:4:4 o 4:2:0 configurables.
+- Portapapeles con PNG, DIBV5 y DIB clásico; reintentos ampliados y gestión explícita de memoria.
+- Modos de región, ventana, pantalla y escritorio completo, con botones y teclas en el selector.
+- Adquisición nativa de ventanas mediante Windows Graphics Capture.
+- Retardo cancelable de 3, 5 o 10 segundos.
+- Editor propio con lápiz, resaltador, flechas, rectángulos, texto, ocultación, recorte, deshacer, rehacer, copiar y guardar como.
+- Opción de continuar usando el flujo rápido sin abrir el editor.
+- Corrección de la conversión de subnormales FP16, del búfer de mensajes UTF-8 y del tiempo de vida de callbacks después de un timeout.
+- Etiquetado sRGB de PNG y JPEG, configuración con escalado DPI y pruebas automatizadas de codificación, portapapeles, editor y selector.
+- Pendiente de validación interactiva en Steam, juegos exclusivos y transiciones HDR/SDR; ver `docs/REVIEW-0.5.md`.
+
 Todas las modificaciones relevantes se documentarán en este archivo.
 
 ## 0.4.1 - 2026-08-11

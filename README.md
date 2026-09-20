@@ -10,6 +10,8 @@
 
 Herramienta Win32 nativa para capturar regiones de una pantalla con HDR activo y guardarlas como imágenes SDR con colores y brillo correctos.
 
+La versión **0.5.0-beta.1** amplía el flujo a región, ventana, pantalla, escritorio completo, retardo y un editor propio. Consulta [la revisión y las pruebas](docs/REVIEW-0.5.md) antes de sustituir una instalación estable.
+
 NativeHDRShot utiliza Windows Graphics Capture y Direct3D 11. La captura se realiza internamente en `R16G16B16A16_FLOAT` (scRGB), se normaliza usando el nivel de blanco SDR configurado para el monitor y finalmente se convierte a sRGB. No guarda archivos HDR.
 
 ## Características
@@ -22,7 +24,10 @@ NativeHDRShot utiliza Windows Graphics Capture y Direct3D 11. La captura se real
 - Selección limpia: cursor en cruz y marco, sin animaciones ni carteles.
 - Fotograma congelado antes de seleccionar: la cruz se muestra en primer plano incluso sobre juegos a pantalla completa.
 - `Enter` captura el escritorio virtual completo y `Esc` cancela.
-- PNG sin pérdida o JPEG con calidad configurable entre 50 y 100 %.
+- Perfiles Ligera, Equilibrada y Máxima, con resolución y calidad JPEG configurables.
+- Captura de ventana mediante Windows Graphics Capture y selección de pantalla con un clic.
+- Retardo de 3, 5 o 10 segundos, cancelable desde el menú de bandeja.
+- Editor de lápiz, resaltador, flechas, rectángulos, texto, ocultación opaca, recorte y deshacer/rehacer.
 - Copia automática de la captura SDR al portapapeles de Windows.
 - Aviso visual discreto al completar la captura, incluso si Windows silencia las notificaciones de bandeja.
 - Selector continuo a través de todos los monitores, incluso con posiciones y resoluciones diferentes.
@@ -68,6 +73,9 @@ Durante la selección:
 | Acción | Resultado |
 |---|---|
 | Arrastrar con el botón izquierdo | Capturar región |
+| `R`, `V`, `P` o botones del selector | Elegir región, ventana o pantalla |
+| Clic en modo Ventana | Capturar la ventana elegida, sin las ventanas que la cubran |
+| Clic en modo Pantalla | Capturar el monitor elegido |
 | `Enter` | Capturar el escritorio virtual completo |
 | `Esc` o botón derecho | Cancelar |
 
@@ -77,14 +85,40 @@ Las imágenes se guardan por mes en:
 %USERPROFILE%\Pictures\NativeHDRShot\AAAA-MM
 ```
 
-La misma imagen SDR queda disponible en el portapapeles para pegarla directamente con `Ctrl + V`. NativeHDRShot usa el formato nativo `CF_DIBV5`; Windows puede convertirlo automáticamente para aplicaciones que soliciten `CF_DIB` o `CF_BITMAP`.
+La imagen SDR queda disponible en el portapapeles para pegarla con `Ctrl + V`: PNG, `CF_DIBV5` sRGB y `CF_DIB` de 24 bits. Windows también proporciona `CF_BITMAP` cuando se solicita. Estos formatos amplían la compatibilidad con clientes web y aplicaciones como Steam; la prueba directa de pegado en Steam está pendiente. El portapapeles conserva los píxeles SDR sin compresión JPEG, incluso si el archivo se guarda en JPEG.
+
+El menú de bandeja permite elegir directamente el modo y un **retardo de 0, 3, 5 o 10 segundos**. El retardo se aplica antes de congelar el escritorio, para poder abrir un menú o preparar la escena. Puedes cancelarlo desde ese mismo menú. El modo Ventana adquiere un nuevo fotograma de la ventana después de seleccionarla; los demás modos recortan la imagen congelada.
+
+## Editar una captura
+
+El archivo original se guarda y se copia primero. Por defecto se abre después el editor:
+
+- Elige Lápiz, Resaltador (rectángulo translúcido), Flecha, Rectángulo, Texto, Ocultar o Recortar.
+- Para texto, escríbelo en el campo superior y pulsa sobre la imagen.
+- **Ocultar** aplica un rectángulo negro opaco a los píxeles de la copia exportada. El archivo original permanece en la carpeta de capturas.
+- `Ctrl + Z` deshace; `Ctrl + Y` rehace. El historial conserva hasta 20 cambios, limitado por memoria.
+- `Ctrl + C` copia el resultado editado. `Ctrl + S` abre **Guardar como**, con PNG o JPEG.
+- Al cerrar con cambios sin guardar, puedes guardarlos, descartarlos o continuar editando.
+
+Para capturar y pegar sin abrir el editor, desmarca **Abrir editor después de capturar** en la bandeja. **Editar última captura** permite abrirlo más tarde durante la misma sesión.
 
 ## Configuración de calidad
 
 Haz clic derecho en el icono del área de notificación y abre `Configuración…`.
 
-- **PNG — máxima calidad:** formato predeterminado y sin pérdida.
-- **JPEG — archivo más pequeño:** permite ajustar la calidad entre 50 y 100 %.
+| Perfil | Archivo | Resolución |
+|---|---|---|
+| **Ligera — compartir** | JPEG 80, color 4:2:0 | Lado mayor limitado a 1920 px |
+| **Equilibrada — detalle** | JPEG 92, color 4:4:4 | Original |
+| **Máxima — PNG original** | PNG sin pérdida | Original |
+| **Personalizada** | PNG o JPEG 30–100, color 4:2:0 o 4:4:4 | Original, 1280, 1920, 2560 o 3840 px |
+
+La reducción respeta la proporción, no amplía recortes pequeños y se aplica **al archivo y al portapapeles** después de seleccionar la región. PNG original sigue siendo el valor predeterminado. Las preferencias anteriores de formato y calidad se conservan.
+
+El peso depende del contenido: PNG puede ser más pequeño en gráficos planos o texto; JPEG suele reducir fotografías y escenas de juegos. JPEG al 100 % sigue teniendo pérdida. 4:4:4 conserva más detalle de color, especialmente en letras y bordes; 4:2:0 reduce el peso. La aplicación que recibe el pegado puede volver a comprimir la imagen.
+
+Estado del atajo:
+
 - **Impr Pant protegido:** el icono normal indica que el hook nativo está activo.
 - **Impr Pant sin protección:** el icono de advertencia indica que queda únicamente la reserva del atajo; usa el botón **Recuperar Impr Pant**.
 
@@ -122,6 +156,8 @@ Desde PowerShell:
 El resultado se genera en `bin\NativeHDRShot.exe`. La configuración Release enlaza estáticamente el runtime de C++, por lo que el ejecutable no necesita instalar el Visual C++ Redistributable.
 
 También puedes abrir [`NativeHDRShot.sln`](NativeHDRShot.sln) en Visual Studio y compilar `Release | x64`.
+
+Pruebas automatizadas: `./test.ps1`. Para incluir capturas reales del escritorio y de una ventana de prueba: `./test.ps1 -CaptureSmoke`. Las pruebas normales usan un portapapeles aislado del usuario. Las capturas de humo permanecen en memoria y no se publican ni se guardan.
 
 ## Estructura
 

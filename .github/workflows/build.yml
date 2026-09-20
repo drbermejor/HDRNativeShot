@@ -23,6 +23,10 @@ jobs:
       - name: Build Release x64
         run: msbuild NativeHDRShot.sln /m /p:Configuration=Release /p:Platform=x64
 
+      - name: Test encoders, clipboard, editor and selector
+        shell: pwsh
+        run: ./test.ps1
+
       - name: Upload executable
         uses: actions/upload-artifact@v7
         with:

@@ -18,6 +18,10 @@
 #include <wrl/client.h>
 
 #include "resource.h"
+#include "image_output.h"
+#include "capture_editor.h"
+#include <dwmapi.h>
+#pragma comment(lib, "dwmapi.lib")
 
 #include <algorithm>
 #include <atomic>
@@ -38,6 +42,7 @@
 #include <thread>
 #include <vector>
 
+using namespace image_output;
 using Microsoft::WRL::ComPtr;
 using namespace winrt;
 namespace WGC = winrt::Windows::Graphics::Capture;
@@ -55,11 +60,20 @@ constexpr UINT kPreviewReady = WM_APP + 4;
 constexpr UINT kRegionSelectionFinalize = WM_APP + 50;
 constexpr UINT_PTR kCaptureNotificationTimer = 1;
 constexpr UINT_PTR kRegionTopmostTimer = 2;
+constexpr UINT_PTR kCaptureDelayTimer = 3;
 constexpr UINT kMenuCapture = 100;
 constexpr UINT kMenuOpenFolder = 101;
 constexpr UINT kMenuSettings = 102;
 constexpr UINT kMenuExit = 103;
 constexpr UINT kMenuRecoverPrintScreen = 104;
+constexpr UINT kMenuWindow = 105;
+constexpr UINT kMenuMonitor = 106;
+constexpr UINT kMenuDesktop = 107;
+constexpr UINT kMenuEditor = 108;
+constexpr UINT kMenuAutoEditor = 109;
+constexpr UINT kMenuCancelDelay = 110;
+constexpr UINT kMenuDelayBase = 120;
+enum class CaptureMode { Region, Window, Monitor, Desktop };
 constexpr UINT kSettingsFormat = 200;
 constexpr UINT kSettingsQuality = 201;
 constexpr UINT kSettingsQualityValue = 202;
@@ -67,18 +81,11 @@ constexpr UINT kSettingsSave = 203;
 constexpr UINT kSettingsCancel = 204;
 constexpr UINT kSettingsPrintScreenStatus = 205;
 constexpr UINT kSettingsRecoverPrintScreen = 206;
+constexpr UINT kSettingsPreset = 207;
+constexpr UINT kSettingsSize = 208;
+constexpr UINT kSettingsChroma = 209;
 constexpr int kHotkeyPrintScreen = 1;
 constexpr int kHotkeyFallback = 2;
-
-enum class OutputFormat : DWORD {
-    Png = 0,
-    Jpeg = 1,
-};
-
-struct CaptureSettings {
-    OutputFormat format = OutputFormat::Png;
-    int jpegQuality = 92;
-};
 
 struct CaptureResult {
     bool ok = false;
@@ -107,8 +114,29 @@ CaptureSettings LoadSettings() noexcept {
     size = sizeof(value);
     if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\NativeHDRShot", L"JpegQuality",
                      RRF_RT_REG_DWORD, nullptr, &value, &size) == ERROR_SUCCESS) {
-        settings.jpegQuality = std::clamp(static_cast<int>(value), 50, 100);
+        settings.jpegQuality = static_cast<int>(std::clamp(value, 30ul, 100ul));
     }
+    value = 0;
+    size = sizeof(value);
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\NativeHDRShot", L"JpegFullChroma",
+                    RRF_RT_REG_DWORD, nullptr, &value, &size) == ERROR_SUCCESS && value <= 1)
+        settings.jpegFullChroma = value != 0;
+    value = 0;
+    size = sizeof(value);
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\NativeHDRShot", L"MaxDimension",
+                    RRF_RT_REG_DWORD, nullptr, &value, &size) == ERROR_SUCCESS &&
+        std::find(std::begin(kSizeLimits), std::end(kSizeLimits), value) != std::end(kSizeLimits))
+        settings.maxDimension = value;
+    value = 1;
+    size = sizeof(value);
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\NativeHDRShot", L"OpenEditor",
+                    RRF_RT_REG_DWORD, nullptr, &value, &size) == ERROR_SUCCESS && value <= 1)
+        settings.openEditor = value != 0;
+    value = 0;
+    size = sizeof(value);
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\NativeHDRShot", L"DelaySeconds",
+                    RRF_RT_REG_DWORD, nullptr, &value, &size) == ERROR_SUCCESS &&
+        (value == 0 || value == 3 || value == 5 || value == 10)) settings.delaySeconds = value;
     return settings;
 }
 
@@ -123,7 +151,23 @@ void SaveSettings(const CaptureSettings& settings) {
         key, L"Format", 0, REG_DWORD, reinterpret_cast<const BYTE*>(&format), sizeof(format));
     const LSTATUS qualityStatus = RegSetValueExW(
         key, L"JpegQuality", 0, REG_DWORD, reinterpret_cast<const BYTE*>(&quality), sizeof(quality));
+    const DWORD chroma = settings.jpegFullChroma ? 1 : 0;
+    const DWORD dimension = settings.maxDimension;
+    const LSTATUS chromaStatus = RegSetValueExW(
+        key, L"JpegFullChroma", 0, REG_DWORD, reinterpret_cast<const BYTE*>(&chroma), sizeof(chroma));
+    const LSTATUS dimensionStatus = RegSetValueExW(
+        key, L"MaxDimension", 0, REG_DWORD, reinterpret_cast<const BYTE*>(&dimension), sizeof(dimension));
+    const DWORD editor = settings.openEditor ? 1 : 0;
+    const DWORD delay = settings.delaySeconds;
+    const LSTATUS editorStatus = RegSetValueExW(
+        key, L"OpenEditor", 0, REG_DWORD, reinterpret_cast<const BYTE*>(&editor), sizeof(editor));
+    const LSTATUS delayStatus = RegSetValueExW(
+        key, L"DelaySeconds", 0, REG_DWORD, reinterpret_cast<const BYTE*>(&delay), sizeof(delay));
     RegCloseKey(key);
+    check_hresult(HRESULT_FROM_WIN32(editorStatus));
+    check_hresult(HRESULT_FROM_WIN32(delayStatus));
+    check_hresult(HRESULT_FROM_WIN32(chromaStatus));
+    check_hresult(HRESULT_FROM_WIN32(dimensionStatus));
     check_hresult(HRESULT_FROM_WIN32(formatStatus));
     check_hresult(HRESULT_FROM_WIN32(qualityStatus));
 }
@@ -214,88 +258,6 @@ std::filesystem::path MonthlyOutputDirectory() {
     return path;
 }
 
-float HalfToFloat(uint16_t half) noexcept {
-    const uint32_t sign = (static_cast<uint32_t>(half & 0x8000u)) << 16;
-    uint32_t exponent = (half >> 10) & 0x1fu;
-    uint32_t mantissa = half & 0x3ffu;
-    uint32_t bits = 0;
-    if (exponent == 0) {
-        if (mantissa == 0) {
-            bits = sign;
-        } else {
-            int shift = 0;
-            while ((mantissa & 0x400u) == 0) {
-                mantissa <<= 1;
-                ++shift;
-            }
-            mantissa &= 0x3ffu;
-            const uint32_t floatExponent = static_cast<uint32_t>(127 - 15 - shift);
-            bits = sign | (floatExponent << 23) | (mantissa << 13);
-        }
-    } else if (exponent == 31) {
-        bits = sign | 0x7f800000u | (mantissa << 13);
-    } else {
-        bits = sign | ((exponent + (127 - 15)) << 23) | (mantissa << 13);
-    }
-    return std::bit_cast<float>(bits);
-}
-
-uint8_t LinearToSrgbByte(float value) noexcept {
-    value = std::clamp(value, 0.0f, 1.0f);
-    const float encoded = value <= 0.0031308f
-        ? value * 12.92f
-        : 1.055f * std::pow(value, 1.0f / 2.4f) - 0.055f;
-    return static_cast<uint8_t>(std::clamp(std::lround(encoded * 255.0f), 0l, 255l));
-}
-
-void SaveWic(
-    const std::filesystem::path& path,
-    REFGUID container,
-    REFGUID requestedPixelFormat,
-    UINT width,
-    UINT height,
-    UINT stride,
-    const BYTE* pixels,
-    UINT byteCount,
-    float encoderQuality = -1.0f) {
-    ComPtr<IWICImagingFactory> factory;
-    check_hresult(CoCreateInstance(CLSID_WICImagingFactory2, nullptr, CLSCTX_INPROC_SERVER,
-                                   IID_PPV_ARGS(&factory)));
-    ComPtr<IWICStream> stream;
-    check_hresult(factory->CreateStream(&stream));
-    check_hresult(stream->InitializeFromFilename(path.c_str(), GENERIC_WRITE));
-    ComPtr<IWICBitmapEncoder> encoder;
-    check_hresult(factory->CreateEncoder(container, nullptr, &encoder));
-    check_hresult(encoder->Initialize(stream.Get(), WICBitmapEncoderNoCache));
-    ComPtr<IWICBitmapFrameEncode> frame;
-    ComPtr<IPropertyBag2> options;
-    check_hresult(encoder->CreateNewFrame(&frame, &options));
-    if (encoderQuality >= 0.0f && options) {
-        PROPBAG2 property{};
-        property.pstrName = const_cast<wchar_t*>(L"ImageQuality");
-        VARIANT value{};
-        VariantInit(&value);
-        value.vt = VT_R4;
-        value.fltVal = std::clamp(encoderQuality, 0.0f, 1.0f);
-        check_hresult(options->Write(1, &property, &value));
-        VariantClear(&value);
-    }
-    check_hresult(frame->Initialize(options.Get()));
-    check_hresult(frame->SetSize(width, height));
-    check_hresult(frame->SetResolution(96.0, 96.0));
-
-    WICPixelFormatGUID actualFormat = requestedPixelFormat;
-    check_hresult(frame->SetPixelFormat(&actualFormat));
-    if (!IsEqualGUID(actualFormat, requestedPixelFormat)) {
-        throw hresult_error(WINCODEC_ERR_UNSUPPORTEDPIXELFORMAT,
-                            L"El códec WIC no admite el formato solicitado");
-    }
-
-    check_hresult(frame->WritePixels(height, stride, byteCount, const_cast<BYTE*>(pixels)));
-    check_hresult(frame->Commit());
-    check_hresult(encoder->Commit());
-}
-
 ComPtr<ID3D11Device> CreateDeviceForMonitor(HMONITOR monitor, ComPtr<ID3D11DeviceContext>& context) {
     ComPtr<IDXGIFactory1> factory;
     check_hresult(CreateDXGIFactory1(IID_PPV_ARGS(&factory)));
@@ -346,11 +308,16 @@ struct CapturedTexture {
     UINT height = 0;
 };
 
-CapturedTexture CaptureTexture(HMONITOR monitor) {
+CapturedTexture CaptureTexture(HMONITOR monitor, HWND window = nullptr) {
     ComPtr<ID3D11DeviceContext> context;
     auto d3dDevice = CreateDeviceForMonitor(monitor, context);
     const auto winrtDevice = ToWinRtDevice(d3dDevice);
-    const auto item = ItemForMonitor(monitor);
+    auto item = ItemForMonitor(monitor);
+    if (window) {
+        auto interop = get_activation_factory<WGC::GraphicsCaptureItem, IGraphicsCaptureItemInterop>();
+        item = nullptr;
+        check_hresult(interop->CreateForWindow(window, guid_of<WGC::GraphicsCaptureItem>(), put_abi(item)));
+    }
     const auto size = item.Size();
     if (size.Width <= 0 || size.Height <= 0) throw hresult_error(E_FAIL, L"El monitor no tiene un tamaño válido");
 
@@ -365,22 +332,27 @@ CapturedTexture CaptureTexture(HMONITOR monitor) {
         HANDLE eventHandle = nullptr;
         HRESULT hr = E_FAIL;
         CapturedTexture result;
-    } state;
-    state.eventHandle = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    if (!state.eventHandle) throw hresult_error(HRESULT_FROM_WIN32(GetLastError()));
-    const auto closeEvent = std::unique_ptr<void, decltype(&CloseHandle)>(state.eventHandle, CloseHandle);
+        ~SharedState() { if (eventHandle) CloseHandle(eventHandle); }
+    };
+    auto state = std::make_shared<SharedState>();
+    state->eventHandle = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!state->eventHandle) throw hresult_error(HRESULT_FROM_WIN32(GetLastError()));
 
-    const auto token = pool.FrameArrived([&](WGC::Direct3D11CaptureFramePool const& sender,
+    const auto token = pool.FrameArrived([state, d3dDevice, context](WGC::Direct3D11CaptureFramePool const& sender,
                                               winrt::Windows::Foundation::IInspectable const&) noexcept {
-        if (state.completed.exchange(true)) return;
+        if (state->completed.exchange(true)) return;
         try {
             auto frame = sender.TryGetNextFrame();
+            if (!frame) throw hresult_error(E_FAIL, L"Fotograma vacío");
             const auto content = frame.ContentSize();
             auto access = frame.Surface().as<::Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess>();
             ComPtr<ID3D11Texture2D> source;
             check_hresult(access->GetInterface(IID_PPV_ARGS(&source)));
             D3D11_TEXTURE2D_DESC desc{};
             source->GetDesc(&desc);
+            if (content.Width <= 0 || content.Height <= 0 ||
+                static_cast<UINT>(content.Width) > desc.Width || static_cast<UINT>(content.Height) > desc.Height)
+                throw hresult_error(HRESULT_FROM_WIN32(ERROR_RETRY), L"La pantalla cambió de tamaño; vuelve a capturar");
             desc.Width = static_cast<UINT>(content.Width);
             desc.Height = static_cast<UINT>(content.Height);
             desc.MipLevels = 1;
@@ -390,124 +362,42 @@ CapturedTexture CaptureTexture(HMONITOR monitor) {
             desc.BindFlags = 0;
             desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
             desc.MiscFlags = 0;
-            check_hresult(d3dDevice->CreateTexture2D(&desc, nullptr, &state.result.staging));
+            check_hresult(d3dDevice->CreateTexture2D(&desc, nullptr, &state->result.staging));
             D3D11_BOX box{0, 0, 0, desc.Width, desc.Height, 1};
-            context->CopySubresourceRegion(state.result.staging.Get(), 0, 0, 0, 0, source.Get(), 0, &box);
+            context->CopySubresourceRegion(state->result.staging.Get(), 0, 0, 0, 0, source.Get(), 0, &box);
             context->Flush();
-            state.result.width = desc.Width;
-            state.result.height = desc.Height;
-            state.hr = S_OK;
+            state->result.width = desc.Width;
+            state->result.height = desc.Height;
+            state->hr = S_OK;
         } catch (const hresult_error& error) {
-            state.hr = error.code();
+            state->hr = error.code();
         } catch (...) {
-            state.hr = E_FAIL;
+            state->hr = E_FAIL;
         }
-        SetEvent(state.eventHandle);
+        SetEvent(state->eventHandle);
     });
 
     session.StartCapture();
-    const DWORD wait = WaitForSingleObject(state.eventHandle, 5000);
+    const DWORD wait = WaitForSingleObject(state->eventHandle, 5000);
     pool.FrameArrived(token);
     session.Close();
     pool.Close();
     if (wait != WAIT_OBJECT_0) throw hresult_error(HRESULT_FROM_WIN32(wait == WAIT_TIMEOUT ? ERROR_TIMEOUT : GetLastError()),
                                                     L"Windows no entregó ningún fotograma en 5 segundos");
-    check_hresult(state.hr);
-    return std::move(state.result);
+    check_hresult(state->hr);
+    return std::move(state->result);
 }
 
 float SdrWhiteLevelMultiplier(HMONITOR monitor) noexcept;
 
-bool CopySdrToClipboard(HWND owner, UINT width, UINT height, UINT stride,
-                        const BYTE* pixels, std::wstring& error) noexcept {
-    if (!owner || !IsWindow(owner)) {
-        error = L"No hay una ventana válida para controlar el portapapeles";
-        return false;
-    }
-    if (!pixels || width == 0 || height == 0 ||
-        width > static_cast<UINT>(std::numeric_limits<LONG>::max()) ||
-        height > static_cast<UINT>(std::numeric_limits<LONG>::max())) {
-        error = L"La imagen no tiene dimensiones válidas para el portapapeles";
-        return false;
-    }
-
-    const size_t pixelBytes = static_cast<size_t>(stride) * height;
-    if (pixelBytes > std::numeric_limits<DWORD>::max() ||
-        pixelBytes > std::numeric_limits<size_t>::max() - sizeof(BITMAPV5HEADER)) {
-        error = L"La imagen es demasiado grande para el portapapeles";
-        return false;
-    }
-
-    const size_t allocationSize = sizeof(BITMAPV5HEADER) + pixelBytes;
-    HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, allocationSize);
-    if (!memory) {
-        error = L"No se pudo reservar memoria para el portapapeles";
-        return false;
-    }
-
-    void* locked = GlobalLock(memory);
-    if (!locked) {
-        GlobalFree(memory);
-        error = L"No se pudo preparar la imagen para el portapapeles";
-        return false;
-    }
-
-    BITMAPV5HEADER header{};
-    header.bV5Size = sizeof(header);
-    header.bV5Width = static_cast<LONG>(width);
-    header.bV5Height = -static_cast<LONG>(height);
-    header.bV5Planes = 1;
-    header.bV5BitCount = 32;
-    header.bV5Compression = BI_BITFIELDS;
-    header.bV5SizeImage = static_cast<DWORD>(pixelBytes);
-    header.bV5RedMask = 0x00FF0000;
-    header.bV5GreenMask = 0x0000FF00;
-    header.bV5BlueMask = 0x000000FF;
-    header.bV5AlphaMask = 0xFF000000;
-    header.bV5CSType = LCS_sRGB;
-    header.bV5Intent = LCS_GM_IMAGES;
-    std::memcpy(locked, &header, sizeof(header));
-    std::memcpy(static_cast<BYTE*>(locked) + sizeof(header), pixels, pixelBytes);
-    GlobalUnlock(memory);
-
-    bool opened = false;
-    for (int attempt = 0; attempt < 10 && !opened; ++attempt) {
-        opened = OpenClipboard(owner) != FALSE;
-        if (!opened) std::this_thread::sleep_for(std::chrono::milliseconds(25));
-    }
-    if (!opened) {
-        GlobalFree(memory);
-        error = L"Otra aplicación mantiene ocupado el portapapeles";
-        return false;
-    }
-
-    if (!EmptyClipboard()) {
-        const HRESULT failure = HRESULT_FROM_WIN32(GetLastError());
-        CloseClipboard();
-        GlobalFree(memory);
-        error = L"No se pudo vaciar el portapapeles: " + HResultText(failure);
-        return false;
-    }
-    if (!SetClipboardData(CF_DIBV5, memory)) {
-        const HRESULT failure = HRESULT_FROM_WIN32(GetLastError());
-        CloseClipboard();
-        GlobalFree(memory);
-        error = L"No se pudo copiar la imagen: " + HResultText(failure);
-        return false;
-    }
-
-    CloseClipboard();
-    return true;
-}
-
 CaptureResult CaptureMonitor(HMONITOR monitor, const CaptureSettings& settings,
                              const RECT* requestedRegion = nullptr,
                              HWND clipboardOwner = nullptr,
-                             bool deferSave = false) {
+                             bool deferSave = false, HWND window = nullptr) {
     CaptureResult result;
     try {
         result.sdrWhiteMultiplier = SdrWhiteLevelMultiplier(monitor);
-        auto captured = CaptureTexture(monitor);
+        auto captured = CaptureTexture(monitor, window);
         ComPtr<ID3D11Device> device;
         captured.staging->GetDevice(&device);
         ComPtr<ID3D11DeviceContext> context;
@@ -528,8 +418,8 @@ CaptureResult CaptureMonitor(HMONITOR monitor, const CaptureSettings& settings,
             crop.right = std::clamp(requestedRegion->right, crop.left, static_cast<LONG>(captured.width));
             crop.bottom = std::clamp(requestedRegion->bottom, crop.top, static_cast<LONG>(captured.height));
         }
-        const UINT outputWidth = static_cast<UINT>(crop.right - crop.left);
-        const UINT outputHeight = static_cast<UINT>(crop.bottom - crop.top);
+        UINT outputWidth = static_cast<UINT>(crop.right - crop.left);
+        UINT outputHeight = static_cast<UINT>(crop.bottom - crop.top);
         if (outputWidth == 0 || outputHeight == 0)
             throw hresult_error(E_INVALIDARG, L"La región seleccionada está vacía");
 
@@ -552,7 +442,7 @@ CaptureResult CaptureMonitor(HMONITOR monitor, const CaptureSettings& settings,
         }
         result.peakLinear = peak / result.sdrWhiteMultiplier;
 
-        const UINT sdrStride = outputWidth * 4;
+        UINT sdrStride = outputWidth * 4;
         std::vector<BYTE> sdrPixels(static_cast<size_t>(sdrStride) * outputHeight);
         const bool toneMap = result.peakLinear > 1.01f;
         // Keep shadows untouched and progressively compress HDR highlights into SDR.
@@ -592,32 +482,16 @@ CaptureResult CaptureMonitor(HMONITOR monitor, const CaptureSettings& settings,
             result.ok = true;
             return result;
         }
-        const auto outputDir = MonthlyOutputDirectory();
-        const auto base = BaseFilename();
-        result.sdrPath = outputDir / (base + (settings.format == OutputFormat::Png ? L".png" : L".jpg"));
-        if (settings.format == OutputFormat::Png) {
-            SaveWic(result.sdrPath, GUID_ContainerFormatPng, GUID_WICPixelFormat32bppBGRA,
-                    outputWidth, outputHeight, sdrStride, sdrPixels.data(),
-                    static_cast<UINT>(sdrPixels.size()));
-        } else {
-            const UINT jpegStride = outputWidth * 3;
-            std::vector<BYTE> jpegPixels(static_cast<size_t>(jpegStride) * outputHeight);
-            for (UINT y = 0; y < outputHeight; ++y) {
-                const BYTE* source = sdrPixels.data() + static_cast<size_t>(sdrStride) * y;
-                BYTE* destination = jpegPixels.data() + static_cast<size_t>(jpegStride) * y;
-                for (UINT x = 0; x < outputWidth; ++x) {
-                    destination[x * 3 + 0] = source[x * 4 + 0];
-                    destination[x * 3 + 1] = source[x * 4 + 1];
-                    destination[x * 3 + 2] = source[x * 4 + 2];
-                }
-            }
-            SaveWic(result.sdrPath, GUID_ContainerFormatJpeg, GUID_WICPixelFormat24bppBGR,
-                    outputWidth, outputHeight, jpegStride, jpegPixels.data(),
-                    static_cast<UINT>(jpegPixels.size()), settings.jpegQuality / 100.0f);
-        }
+        ResizeSdr(outputWidth, outputHeight, sdrStride, sdrPixels, settings.maxDimension);
+        result.sdrPath = MonthlyOutputDirectory() /
+            (BaseFilename() + (settings.format == OutputFormat::Png ? L".png" : L".jpg"));
+        SaveSdrFile(result.sdrPath, settings, outputWidth, outputHeight, sdrStride, sdrPixels);
         result.clipboardCopied = CopySdrToClipboard(
-            clipboardOwner, outputWidth, outputHeight, sdrStride,
-            sdrPixels.data(), result.clipboardError);
+            clipboardOwner, outputWidth, outputHeight, sdrStride, sdrPixels.data(), result.clipboardError);
+        result.pixelWidth = outputWidth;
+        result.pixelHeight = outputHeight;
+        result.pixelStride = sdrStride;
+        result.sdrPixels = std::move(sdrPixels);
         result.ok = true;
     } catch (const hresult_error& error) {
         result.error = error.message() + L": " + HResultText(error.code());
@@ -627,8 +501,9 @@ CaptureResult CaptureMonitor(HMONITOR monitor, const CaptureSettings& settings,
         }
     } catch (const std::exception& error) {
         const int needed = MultiByteToWideChar(CP_UTF8, 0, error.what(), -1, nullptr, 0);
-        std::wstring wide(needed > 0 ? needed - 1 : 0, L'\0');
+        std::wstring wide(needed > 0 ? needed : 0, L'\0');
         if (needed > 1) MultiByteToWideChar(CP_UTF8, 0, error.what(), -1, wide.data(), needed);
+        if (!wide.empty()) wide.pop_back();
         result.error = wide.empty() ? L"Error inesperado" : wide;
     } catch (...) {
         result.error = L"Error inesperado durante la captura";
@@ -769,12 +644,12 @@ CaptureResult SavePreparedCrop(const CaptureResult& prepared, const RECT& reques
         crop.top = std::clamp(requestedRegion.top, 0L, static_cast<LONG>(prepared.pixelHeight));
         crop.right = std::clamp(requestedRegion.right, crop.left, static_cast<LONG>(prepared.pixelWidth));
         crop.bottom = std::clamp(requestedRegion.bottom, crop.top, static_cast<LONG>(prepared.pixelHeight));
-        const UINT width = static_cast<UINT>(crop.right - crop.left);
-        const UINT height = static_cast<UINT>(crop.bottom - crop.top);
+        UINT width = static_cast<UINT>(crop.right - crop.left);
+        UINT height = static_cast<UINT>(crop.bottom - crop.top);
         if (width == 0 || height == 0)
             throw hresult_error(E_INVALIDARG, L"La región seleccionada está vacía");
 
-        const UINT stride = width * 4;
+        UINT stride = width * 4;
         std::vector<BYTE> pixels(static_cast<size_t>(stride) * height);
         for (UINT y = 0; y < height; ++y) {
             const BYTE* source = prepared.sdrPixels.data() +
@@ -783,30 +658,16 @@ CaptureResult SavePreparedCrop(const CaptureResult& prepared, const RECT& reques
             std::copy_n(source, stride, pixels.data() + static_cast<size_t>(stride) * y);
         }
 
-        const auto outputDir = MonthlyOutputDirectory();
-        const auto base = BaseFilename();
-        result.sdrPath = outputDir / (base + (settings.format == OutputFormat::Png ? L".png" : L".jpg"));
-        if (settings.format == OutputFormat::Png) {
-            SaveWic(result.sdrPath, GUID_ContainerFormatPng, GUID_WICPixelFormat32bppBGRA,
-                    width, height, stride, pixels.data(), static_cast<UINT>(pixels.size()));
-        } else {
-            const UINT jpegStride = width * 3;
-            std::vector<BYTE> jpegPixels(static_cast<size_t>(jpegStride) * height);
-            for (UINT y = 0; y < height; ++y) {
-                const BYTE* source = pixels.data() + static_cast<size_t>(stride) * y;
-                BYTE* destination = jpegPixels.data() + static_cast<size_t>(jpegStride) * y;
-                for (UINT x = 0; x < width; ++x) {
-                    destination[x * 3 + 0] = source[x * 4 + 0];
-                    destination[x * 3 + 1] = source[x * 4 + 1];
-                    destination[x * 3 + 2] = source[x * 4 + 2];
-                }
-            }
-            SaveWic(result.sdrPath, GUID_ContainerFormatJpeg, GUID_WICPixelFormat24bppBGR,
-                    width, height, jpegStride, jpegPixels.data(),
-                    static_cast<UINT>(jpegPixels.size()), settings.jpegQuality / 100.0f);
-        }
+        ResizeSdr(width, height, stride, pixels, settings.maxDimension);
+        result.sdrPath = MonthlyOutputDirectory() /
+            (BaseFilename() + (settings.format == OutputFormat::Png ? L".png" : L".jpg"));
+        SaveSdrFile(result.sdrPath, settings, width, height, stride, pixels);
         result.clipboardCopied = CopySdrToClipboard(
             clipboardOwner, width, height, stride, pixels.data(), result.clipboardError);
+        result.pixelWidth = width;
+        result.pixelHeight = height;
+        result.pixelStride = stride;
+        result.sdrPixels = std::move(pixels);
         result.ok = true;
     } catch (const hresult_error& error) {
         result.error = error.message() + L": " + HResultText(error.code());
@@ -888,12 +749,18 @@ float SdrWhiteLevelMultiplier(HMONITOR monitor) noexcept {
 }
 
 struct RegionSelection {
+    HWND window = nullptr;
     bool accepted = false;
     HMONITOR monitor = nullptr;
     RECT region{};
 };
 
+struct WindowTarget { HWND window; RECT bounds; };
 struct RegionSelectorState {
+    CaptureMode mode = CaptureMode::Region;
+    std::vector<WindowTarget> windows;
+    HWND selectedWindow = nullptr;
+    RECT hover{};
     bool dragging = false;
     bool done = false;
     bool accepted = false;
@@ -979,6 +846,42 @@ LRESULT CALLBACK RegionMouseHookProc(int code, WPARAM wParam, LPARAM lParam) {
     }
 }
 
+void UpdateSelectionHover(RegionSelectorState& state, HWND window) {
+    POINT point = state.current;
+    ClientToScreen(window, &point);
+    RECT screen{};
+    state.selectedWindow = nullptr;
+    if (state.mode == CaptureMode::Window) {
+        for (const auto& target : state.windows) {
+            if (PtInRect(&target.bounds, point)) {
+                screen = target.bounds;
+                state.selectedWindow = target.window;
+                break;
+            }
+        }
+    } else if (state.mode == CaptureMode::Monitor) {
+        MONITORINFO info{sizeof(info)};
+        if (GetMonitorInfoW(MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST), &info)) screen = info.rcMonitor;
+    }
+    MapWindowPoints(nullptr, window, reinterpret_cast<POINT*>(&screen), 2);
+    RECT client{};
+    GetClientRect(window, &client);
+    IntersectRect(&state.hover, &screen, &client);
+}
+
+BOOL CALLBACK CollectWindowTarget(HWND window, LPARAM data) {
+    if (!IsWindowVisible(window) || IsIconic(window) || window == GetShellWindow()) return TRUE;
+    if (GetWindowLongPtrW(window, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) return TRUE;
+    DWORD cloaked = 0;
+    if (SUCCEEDED(DwmGetWindowAttribute(window, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) && cloaked) return TRUE;
+    RECT bounds{};
+    if (FAILED(DwmGetWindowAttribute(window, DWMWA_EXTENDED_FRAME_BOUNDS, &bounds, sizeof(bounds))))
+        GetWindowRect(window, &bounds);
+    if (bounds.right > bounds.left && bounds.bottom > bounds.top)
+        reinterpret_cast<std::vector<WindowTarget>*>(data)->push_back({window, bounds});
+    return TRUE;
+}
+
 LRESULT CALLBACK RegionSelectorProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
     auto* state = reinterpret_cast<RegionSelectorState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
     if (message == WM_NCCREATE) {
@@ -989,7 +892,29 @@ LRESULT CALLBACK RegionSelectorProc(HWND hwnd, UINT message, WPARAM wParam, LPAR
     if (!state) return DefWindowProcW(hwnd, message, wParam, lParam);
 
     switch (message) {
+    case WM_COMMAND:
+        if (LOWORD(wParam) >= 500 && LOWORD(wParam) <= 502) {
+            state->mode = static_cast<CaptureMode>(LOWORD(wParam) - 500);
+            state->dragging = false;
+            UpdateSelectionHover(*state, hwnd);
+            SetFocus(hwnd);
+            InvalidateRect(hwnd, nullptr, TRUE);
+        } else if (LOWORD(wParam) == 503) SendMessageW(hwnd, WM_KEYDOWN, VK_RETURN, 0);
+        else if (LOWORD(wParam) == 504) SendMessageW(hwnd, WM_KEYDOWN, VK_ESCAPE, 0);
+        return 0;
     case WM_LBUTTONDOWN:
+        state->current = {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        if (state->mode != CaptureMode::Region) {
+            UpdateSelectionHover(*state, hwnd);
+            if (!IsRectEmpty(&state->hover)) {
+                state->anchor = {state->hover.left, state->hover.top};
+                state->current = {state->hover.right, state->hover.bottom};
+                state->accepted = true;
+                state->done = true;
+                DestroyWindow(hwnd);
+            }
+            return 0;
+        }
         state->dragging = true;
         state->anchor = {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
         state->current = state->anchor;
@@ -998,6 +923,7 @@ LRESULT CALLBACK RegionSelectorProc(HWND hwnd, UINT message, WPARAM wParam, LPAR
         return 0;
     case WM_MOUSEMOVE:
         state->current = {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        if (state->mode != CaptureMode::Region) UpdateSelectionHover(*state, hwnd);
         InvalidateRect(hwnd, nullptr, TRUE);
         return 0;
     case WM_LBUTTONUP: {
@@ -1020,12 +946,15 @@ LRESULT CALLBACK RegionSelectorProc(HWND hwnd, UINT message, WPARAM wParam, LPAR
         DestroyWindow(hwnd);
         return 0;
     case WM_KEYDOWN:
-        if (wParam == VK_ESCAPE) {
+        if (wParam == 'R' || wParam == 'V' || wParam == 'P') {
+            SendMessageW(hwnd, WM_COMMAND, wParam == 'R' ? 500 : wParam == 'V' ? 501 : 502, 0);
+        } else if (wParam == VK_ESCAPE) {
             state->done = true;
             DestroyWindow(hwnd);
         } else if (wParam == VK_RETURN) {
             RECT client{};
             GetClientRect(hwnd, &client);
+            state->selectedWindow = nullptr;
             state->anchor = {client.left, client.top};
             state->current = {client.right, client.bottom};
             state->accepted = true;
@@ -1079,8 +1008,8 @@ LRESULT CALLBACK RegionSelectorProc(HWND hwnd, UINT message, WPARAM wParam, LPAR
             DeleteObject(transparentBrush);
         }
 
-        if (state->dragging) {
-            RECT selected = NormalizedRect(state->anchor, state->current);
+        if (state->dragging || state->mode != CaptureMode::Region) {
+            RECT selected = state->dragging ? NormalizedRect(state->anchor, state->current) : state->hover;
             HPEN shadow = CreatePen(PS_SOLID, 3, RGB(0, 0, 0));
             HGDIOBJ oldPen = SelectObject(dc, shadow);
             HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(HOLLOW_BRUSH));
@@ -1122,7 +1051,7 @@ LRESULT CALLBACK RegionSelectorProc(HWND hwnd, UINT message, WPARAM wParam, LPAR
     return DefWindowProcW(hwnd, message, wParam, lParam);
 }
 
-RegionSelection SelectRegion(HMONITOR monitor, const CaptureResult* preview = nullptr) {
+RegionSelection SelectRegion(HMONITOR monitor, const CaptureResult* preview = nullptr, CaptureMode mode = CaptureMode::Region) {
     RegionSelection selection;
     selection.monitor = monitor;
     MONITORINFO info{sizeof(info)};
@@ -1146,16 +1075,31 @@ RegionSelection SelectRegion(HMONITOR monitor, const CaptureResult* preview = nu
 
     RegionSelectorState state;
     state.preview = preview;
+    state.mode = mode;
+    EnumWindows(CollectWindowTarget, reinterpret_cast<LPARAM>(&state.windows));
     const int width = selectorBounds.right - selectorBounds.left;
     const int height = selectorBounds.bottom - selectorBounds.top;
     const DWORD selectorExStyle = WS_EX_TOPMOST | WS_EX_TOOLWINDOW |
         (preview ? 0 : WS_EX_NOACTIVATE | WS_EX_LAYERED);
     HWND selector = CreateWindowExW(
         selectorExStyle,
-        L"NativeHDRShot.RegionSelector", L"Seleccionar región", WS_POPUP,
+        L"NativeHDRShot.RegionSelector", L"Seleccionar captura", WS_POPUP | WS_CLIPCHILDREN,
         selectorBounds.left, selectorBounds.top, width, height,
         nullptr, nullptr, GetModuleHandleW(nullptr), &state);
     if (!selector) return selection;
+    const UINT dpi = GetDpiForWindow(selector);
+    const int buttonWidth = MulDiv(110, dpi, 96);
+    const int toolbarX = info.rcMonitor.left - selectorBounds.left +
+        std::max(0L, (info.rcMonitor.right - info.rcMonitor.left - buttonWidth * 5) / 2);
+    const int toolbarY = info.rcMonitor.top - selectorBounds.top + MulDiv(16, dpi, 96);
+    UINT index = 0;
+    for (PCWSTR label : {L"Región (R)", L"Ventana (V)", L"Pantalla (P)", L"Todo (Enter)", L"Cancelar (Esc)"}) {
+        HWND button = CreateWindowExW(0, L"BUTTON", label, WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            toolbarX + static_cast<int>(index) * buttonWidth, toolbarY, buttonWidth, MulDiv(34, dpi, 96),
+            selector, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(500 + index)), GetModuleHandleW(nullptr), nullptr);
+        SendMessageW(button, WM_SETFONT, reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)), TRUE);
+        ++index;
+    }
 
     RECT previousClip{};
     const bool restoreClip = GetClipCursor(&previousClip) != FALSE;
@@ -1164,6 +1108,7 @@ RegionSelection SelectRegion(HMONITOR monitor, const CaptureResult* preview = nu
     POINT cursor{};
     GetCursorPos(&cursor);
     state.current = RegionClientPoint(selector, cursor);
+    UpdateSelectionHover(state, selector);
 
     const HWND previousForeground = GetForegroundWindow();
     bool minimizedPreviousWindow = false;
@@ -1223,6 +1168,7 @@ RegionSelection SelectRegion(HMONITOR monitor, const CaptureResult* preview = nu
     // The frozen preview can take focus safely because the source frame already exists.
     if (state.accepted) {
         selection.accepted = true;
+        selection.window = state.mode == CaptureMode::Window ? state.selectedWindow : nullptr;
         selection.region = NormalizedRect(state.anchor, state.current);
         if (preview && width > 0 && height > 0) {
             selection.region.left = MulDiv(selection.region.left, preview->pixelWidth, width);
@@ -1370,6 +1316,7 @@ void ShowCaptureNotification(HMONITOR monitor, bool clipboardCopied) {
 
 class App {
 public:
+    ~App() { if (captureWorker_.joinable()) captureWorker_.join(); }
     int Run(HINSTANCE instance) {
         instance_ = instance;
         appIcon_ = LoadIconW(instance, MAKEINTRESOURCEW(IDI_APP_ICON));
@@ -1406,6 +1353,8 @@ public:
 
         MSG message{};
         while (GetMessageW(&message, nullptr, 0, 0) > 0) {
+            if (capture_editor::Editor::Translate(message)) continue;
+            if (settingsWindow_ && IsDialogMessageW(settingsWindow_, &message)) continue;
             TranslateMessage(&message);
             DispatchMessageW(&message);
         }
@@ -1414,6 +1363,26 @@ public:
     }
 
 private:
+    static CaptureSettings ReadQualityControls(HWND window) {
+        CaptureSettings settings;
+        settings.format = SendMessageW(GetDlgItem(window, kSettingsFormat), CB_GETCURSEL, 0, 0) == 1
+            ? OutputFormat::Jpeg : OutputFormat::Png;
+        settings.jpegQuality = static_cast<int>(SendMessageW(GetDlgItem(window, kSettingsQuality), TBM_GETPOS, 0, 0));
+        settings.jpegFullChroma = SendMessageW(GetDlgItem(window, kSettingsChroma), CB_GETCURSEL, 0, 0) == 0;
+        const auto sizeIndex = SendMessageW(GetDlgItem(window, kSettingsSize), CB_GETCURSEL, 0, 0);
+        if (sizeIndex >= 0 && sizeIndex < static_cast<LRESULT>(std::size(kSizeLimits)))
+            settings.maxDimension = kSizeLimits[sizeIndex];
+        return settings;
+    }
+
+    static void SetQualityControls(HWND window, const CaptureSettings& settings) {
+        SendMessageW(GetDlgItem(window, kSettingsFormat), CB_SETCURSEL, settings.format == OutputFormat::Png ? 0 : 1, 0);
+        SendMessageW(GetDlgItem(window, kSettingsQuality), TBM_SETPOS, TRUE, settings.jpegQuality);
+        SendMessageW(GetDlgItem(window, kSettingsChroma), CB_SETCURSEL, settings.jpegFullChroma ? 0 : 1, 0);
+        const auto position = std::find(std::begin(kSizeLimits), std::end(kSizeLimits), settings.maxDimension);
+        SendMessageW(GetDlgItem(window, kSettingsSize), CB_SETCURSEL, position - std::begin(kSizeLimits), 0);
+    }
+
     static void UpdateSettingsControls(HWND window) {
         App* self = reinterpret_cast<App*>(GetWindowLongPtrW(window, GWLP_USERDATA));
         if (!self) return;
@@ -1422,6 +1391,8 @@ private:
         const HWND value = GetDlgItem(window, kSettingsQualityValue);
         const bool jpeg = SendMessageW(format, CB_GETCURSEL, 0, 0) == 1;
         EnableWindow(slider, jpeg);
+        EnableWindow(GetDlgItem(window, kSettingsChroma), jpeg);
+        SendMessageW(GetDlgItem(window, kSettingsPreset), CB_SETCURSEL, MatchingPreset(ReadQualityControls(window)), 0);
         const int quality = static_cast<int>(SendMessageW(slider, TBM_GETPOS, 0, 0));
         std::wstring label = jpeg ? std::to_wstring(quality) + L" %" : L"Sin pérdida";
         SetWindowTextW(value, label.c_str());
@@ -1445,58 +1416,76 @@ private:
         switch (message) {
         case WM_CREATE: {
             Log(L"Ventana de configuración creada");
-            HFONT font = CreateFontW(-17, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+            const UINT dpi = GetDpiForWindow(window);
+            SetPropW(window, L"NativeHDRShot.SettingsDpi", reinterpret_cast<HANDLE>(static_cast<UINT_PTR>(dpi)));
+            HFONT font = CreateFontW(-MulDiv(17, dpi, 96), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                                      DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                                      CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
             SetPropW(window, L"NativeHDRShot.SettingsFont", font);
             auto createControl = [&](PCWSTR kind, PCWSTR text, DWORD style,
                                      int x, int y, int width, int height, UINT id) {
                 HWND control = CreateWindowExW(0, kind, text, WS_CHILD | WS_VISIBLE | style,
-                    x, y, width, height, window, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(id)),
+                    MulDiv(x, dpi, 96), MulDiv(y, dpi, 96), MulDiv(width, dpi, 96), MulDiv(height, dpi, 96),
+                    window, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(id)),
                     self->instance_, nullptr);
                 SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
                 return control;
             };
-            createControl(L"STATIC", L"Formato", 0, 24, 24, 110, 24, 0);
+            createControl(L"STATIC", L"Perfil", 0, 24, 24, 125, 24, 0);
+            HWND preset = createControl(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_TABSTOP,
+                                       165, 20, 365, 200, kSettingsPreset);
+            for (PCWSTR name : {L"Ligera — compartir", L"Equilibrada — detalle", L"Máxima — PNG original", L"Personalizada"})
+                SendMessageW(preset, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(name));
+            createControl(L"STATIC", L"Formato", 0, 24, 66, 125, 24, 0);
             HWND format = createControl(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_TABSTOP,
-                                        145, 20, 235, 200, kSettingsFormat);
-            SendMessageW(format, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"PNG — máxima calidad"));
-            SendMessageW(format, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"JPEG — archivo más pequeño"));
-            SendMessageW(format, CB_SETCURSEL,
-                         self->settings_.format == OutputFormat::Png ? 0 : 1, 0);
-
-            createControl(L"STATIC", L"Calidad JPEG", 0, 24, 78, 110, 24, 0);
+                                       165, 62, 365, 200, kSettingsFormat);
+            for (PCWSTR name : {L"PNG — sin pérdida", L"JPEG — archivo más pequeño"})
+                SendMessageW(format, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(name));
+            createControl(L"STATIC", L"Calidad JPEG", 0, 24, 110, 125, 24, 0);
             HWND slider = createControl(TRACKBAR_CLASSW, L"", TBS_HORZ | TBS_AUTOTICKS | WS_TABSTOP,
-                                        140, 70, 190, 42, kSettingsQuality);
-            SendMessageW(slider, TBM_SETRANGE, TRUE, MAKELPARAM(50, 100));
+                                       160, 103, 250, 42, kSettingsQuality);
+            SendMessageW(slider, TBM_SETRANGE, TRUE, MAKELPARAM(30, 100));
             SendMessageW(slider, TBM_SETTICFREQ, 10, 0);
-            SendMessageW(slider, TBM_SETPOS, TRUE, self->settings_.jpegQuality);
-            createControl(L"STATIC", L"", SS_CENTER, 335, 78, 55, 24, kSettingsQualityValue);
-
-            createControl(L"STATIC", L"Impr Pant", 0, 24, 126, 110, 24, 0);
-            createControl(L"STATIC", L"", SS_LEFT, 145, 126, 235, 24, kSettingsPrintScreenStatus);
+            createControl(L"STATIC", L"", SS_CENTER, 418, 110, 112, 24, kSettingsQualityValue);
+            createControl(L"STATIC", L"Color JPEG", 0, 24, 154, 125, 24, 0);
+            HWND chroma = createControl(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_TABSTOP,
+                                       165, 150, 365, 200, kSettingsChroma);
+            for (PCWSTR name : {L"Máximo detalle de color (4:4:4)", L"Menor tamaño (4:2:0)"})
+                SendMessageW(chroma, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(name));
+            createControl(L"STATIC", L"Lado máximo", 0, 24, 196, 125, 24, 0);
+            HWND size = createControl(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_TABSTOP,
+                                     165, 192, 365, 200, kSettingsSize);
+            for (PCWSTR name : {L"Original — todos los píxeles", L"1280 px", L"1920 px", L"2560 px", L"3840 px"})
+                SendMessageW(size, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(name));
+            SetQualityControls(window, self->settings_);
+            createControl(L"STATIC", L"El límite de tamaño se aplica al archivo y al pegar. No amplía recortes pequeños. JPEG al 100 % sigue teniendo pérdida.",
+                          0, 24, 232, 506, 46, 0);
+            createControl(L"STATIC", L"Impr Pant", 0, 24, 288, 125, 24, 0);
+            createControl(L"STATIC", L"", SS_LEFT, 165, 288, 365, 24, kSettingsPrintScreenStatus);
             createControl(L"BUTTON", L"Recuperar Impr Pant", BS_PUSHBUTTON | WS_TABSTOP,
-                          145, 155, 235, 32, kSettingsRecoverPrintScreen);
-
+                          165, 317, 365, 32, kSettingsRecoverPrintScreen);
             createControl(L"BUTTON", L"Guardar", BS_DEFPUSHBUTTON | WS_TABSTOP,
-                          205, 215, 86, 32, kSettingsSave);
+                          348, 370, 86, 32, kSettingsSave);
             createControl(L"BUTTON", L"Cancelar", BS_PUSHBUTTON | WS_TABSTOP,
-                          300, 215, 86, 32, kSettingsCancel);
+                          444, 370, 86, 32, kSettingsCancel);
             UpdateSettingsControls(window);
             return 0;
         }
         case WM_COMMAND:
-            if (LOWORD(wParam) == kSettingsFormat && HIWORD(wParam) == CBN_SELCHANGE) {
+            if (LOWORD(wParam) == kSettingsPreset && HIWORD(wParam) == CBN_SELCHANGE) {
+                const int index = static_cast<int>(SendMessageW(GetDlgItem(window, kSettingsPreset), CB_GETCURSEL, 0, 0));
+                if (index < 3) SetQualityControls(window, QualityPreset(index));
+                UpdateSettingsControls(window);
+            } else if ((LOWORD(wParam) == kSettingsFormat || LOWORD(wParam) == kSettingsSize ||
+                        LOWORD(wParam) == kSettingsChroma) && HIWORD(wParam) == CBN_SELCHANGE) {
                 UpdateSettingsControls(window);
             } else if (LOWORD(wParam) == kSettingsRecoverPrintScreen) {
                 self->RecoverPrintScreenControl(true);
                 UpdateSettingsControls(window);
             } else if (LOWORD(wParam) == kSettingsSave) {
-                CaptureSettings updated;
-                updated.format = SendMessageW(GetDlgItem(window, kSettingsFormat), CB_GETCURSEL, 0, 0) == 1
-                    ? OutputFormat::Jpeg : OutputFormat::Png;
-                updated.jpegQuality = static_cast<int>(SendMessageW(
-                    GetDlgItem(window, kSettingsQuality), TBM_GETPOS, 0, 0));
+                CaptureSettings updated = ReadQualityControls(window);
+                updated.openEditor = self->settings_.openEditor;
+                updated.delaySeconds = self->settings_.delaySeconds;
                 try {
                     SaveSettings(updated);
                     self->settings_ = updated;
@@ -1519,9 +1508,33 @@ private:
         case WM_CLOSE:
             DestroyWindow(window);
             return 0;
+        case WM_DPICHANGED: {
+            const UINT oldDpi = static_cast<UINT>(reinterpret_cast<UINT_PTR>(GetPropW(window, L"NativeHDRShot.SettingsDpi")));
+            const UINT dpi = HIWORD(wParam);
+            HFONT font = CreateFontW(-MulDiv(17, dpi, 96), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                                     DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                     CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+            for (HWND child = GetWindow(window, GW_CHILD); child; child = GetWindow(child, GW_HWNDNEXT)) {
+                RECT bounds{};
+                GetWindowRect(child, &bounds);
+                MapWindowPoints(nullptr, window, reinterpret_cast<POINT*>(&bounds), 2);
+                MoveWindow(child, MulDiv(bounds.left, dpi, oldDpi), MulDiv(bounds.top, dpi, oldDpi),
+                           MulDiv(bounds.right - bounds.left, dpi, oldDpi),
+                           MulDiv(bounds.bottom - bounds.top, dpi, oldDpi), TRUE);
+                SendMessageW(child, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+            }
+            DeleteObject(reinterpret_cast<HFONT>(GetPropW(window, L"NativeHDRShot.SettingsFont")));
+            SetPropW(window, L"NativeHDRShot.SettingsFont", font);
+            SetPropW(window, L"NativeHDRShot.SettingsDpi", reinterpret_cast<HANDLE>(static_cast<UINT_PTR>(dpi)));
+            const auto* bounds = reinterpret_cast<RECT*>(lParam);
+            SetWindowPos(window, nullptr, bounds->left, bounds->top, bounds->right - bounds->left,
+                         bounds->bottom - bounds->top, SWP_NOZORDER | SWP_NOACTIVATE);
+            return 0;
+        }
         case WM_DESTROY: {
             Log(L"Ventana de configuración cerrada");
             self->settingsWindow_ = nullptr;
+            RemovePropW(window, L"NativeHDRShot.SettingsDpi");
             HFONT font = reinterpret_cast<HFONT>(RemovePropW(window, L"NativeHDRShot.SettingsFont"));
             if (font) DeleteObject(font);
             return 0;
@@ -1566,7 +1579,26 @@ private:
             StartCapture();
             return 0;
         case WM_COMMAND:
-            if (LOWORD(wParam) == kMenuCapture) StartCapture();
+            if (LOWORD(wParam) == kMenuCapture || LOWORD(wParam) == kMenuWindow ||
+                LOWORD(wParam) == kMenuMonitor || LOWORD(wParam) == kMenuDesktop) {
+                if (!captureActive_) {
+                    captureMode_ = LOWORD(wParam) == kMenuWindow ? CaptureMode::Window :
+                        LOWORD(wParam) == kMenuMonitor ? CaptureMode::Monitor :
+                        LOWORD(wParam) == kMenuDesktop ? CaptureMode::Desktop : CaptureMode::Region;
+                }
+                StartCapture();
+            } else if (LOWORD(wParam) >= kMenuDelayBase && LOWORD(wParam) <= kMenuDelayBase + 10) {
+                settings_.delaySeconds = LOWORD(wParam) - kMenuDelayBase;
+                SaveSettings(settings_);
+            } else if (LOWORD(wParam) == kMenuAutoEditor) {
+                settings_.openEditor = !settings_.openEditor;
+                SaveSettings(settings_);
+            } else if (LOWORD(wParam) == kMenuEditor) OpenLastEditor();
+            else if (LOWORD(wParam) == kMenuCancelDelay && delayPending_) {
+                KillTimer(hwnd_, kCaptureDelayTimer);
+                delayPending_ = false;
+                captureActive_ = false;
+            }
             else if (LOWORD(wParam) == kMenuOpenFolder) {
                 const auto path = OutputRoot();
                 std::filesystem::create_directories(path);
@@ -1576,6 +1608,14 @@ private:
             } else if (LOWORD(wParam) == kMenuRecoverPrintScreen) {
                 RecoverPrintScreenControl(true);
             } else if (LOWORD(wParam) == kMenuExit) {
+                if (captureActive_ && !delayPending_) {
+                    Notify(L"Captura en curso", L"Termina o cancela la captura antes de salir.", NIIF_INFO);
+                    return 0;
+                }
+                if (editorWindow_ && IsWindow(editorWindow_)) {
+                    SendMessageW(editorWindow_, WM_CLOSE, 0, 0);
+                    if (IsWindow(editorWindow_)) return 0;
+                }
                 DestroyWindow(hwnd_);
             }
             return 0;
@@ -1583,7 +1623,15 @@ private:
             if (LOWORD(lParam) == WM_LBUTTONDBLCLK) StartCapture();
             else if (LOWORD(lParam) == WM_RBUTTONUP || LOWORD(lParam) == WM_CONTEXTMENU) ShowTrayMenu();
             return 0;
+        case WM_TIMER:
+            if (wParam == kCaptureDelayTimer) {
+                KillTimer(hwnd_, kCaptureDelayTimer);
+                delayPending_ = false;
+                StartCaptureNow();
+            }
+            return 0;
         case kPreviewReady: {
+            if (captureWorker_.joinable()) captureWorker_.join();
             std::unique_ptr<CaptureResult> prepared(reinterpret_cast<CaptureResult*>(lParam));
             if (!prepared->ok) {
                 captureActive_ = false;
@@ -1593,7 +1641,11 @@ private:
             }
 
             Log(L"Fotograma congelado listo; abriendo selector");
-            const auto selection = SelectRegion(previewMonitor_, prepared.get());
+            RegionSelection selection;
+            if (captureMode_ == CaptureMode::Desktop) {
+                selection.accepted = true;
+                selection.region = {0, 0, static_cast<LONG>(prepared->pixelWidth), static_cast<LONG>(prepared->pixelHeight)};
+            } else selection = SelectRegion(previewMonitor_, prepared.get(), captureMode_);
             if (!selection.accepted) {
                 captureActive_ = false;
                 Log(L"Selección cancelada");
@@ -1601,16 +1653,20 @@ private:
             }
 
             Log(L"Región seleccionada; guardando fotograma congelado");
-            const CaptureSettings settings = settings_;
-            std::thread([this, selection, settings, prepared = std::move(prepared)]() mutable {
+            const CaptureSettings settings = activeSettings_;
+            captureWorker_ = std::thread([this, selection, settings, prepared = std::move(prepared)]() mutable {
                 init_apartment(apartment_type::multi_threaded);
                 auto result = std::make_unique<CaptureResult>(
-                    SavePreparedCrop(*prepared, selection.region, settings, hwnd_));
-                PostMessageW(hwnd_, kCaptureDone, 0, reinterpret_cast<LPARAM>(result.release()));
-            }).detach();
+                    selection.window
+                        ? CaptureMonitor(MonitorFromWindow(selection.window, MONITOR_DEFAULTTONEAREST), settings,
+                                         nullptr, hwnd_, false, selection.window)
+                        : SavePreparedCrop(*prepared, selection.region, settings, hwnd_));
+                if (PostMessageW(hwnd_, kCaptureDone, 0, reinterpret_cast<LPARAM>(result.get()))) result.release();
+            });
             return 0;
         }
         case kCaptureDone: {
+            if (captureWorker_.joinable()) captureWorker_.join();
             std::unique_ptr<CaptureResult> result(reinterpret_cast<CaptureResult*>(lParam));
             captureActive_ = false;
             if (result->ok) {
@@ -1620,10 +1676,13 @@ private:
                             << L", blanco SDR x" << result->sdrWhiteMultiplier << L")"
                             << (result->clipboardCopied ? L" · copiada al portapapeles" : L" · sin portapapeles");
                 Log(messageText.str());
-                if (!result->clipboardCopied) Log(L"AVISO portapapeles: " + result->clipboardError);
+                if (!result->clipboardError.empty()) Log(L"AVISO portapapeles: " + result->clipboardError);
                 Notify(result->clipboardCopied ? L"Captura completada" : L"Captura guardada",
                        messageText.str(), result->clipboardCopied ? NIIF_INFO : NIIF_WARNING);
                 ShowCaptureNotification(previewMonitor_, result->clipboardCopied);
+                lastCapture_ = std::move(result);
+                lastCaptureSettings_ = activeSettings_;
+                if (activeSettings_.openEditor) OpenLastEditor();
             } else {
                 Log(L"ERROR: " + result->error);
                 Notify(L"No se pudo capturar", result->error, NIIF_ERROR);
@@ -1631,6 +1690,7 @@ private:
             return 0;
         }
         case WM_DESTROY:
+            KillTimer(hwnd_, kCaptureDelayTimer);
             ReleasePrintScreenControl();
             UnregisterHotKey(hwnd_, kHotkeyPrintScreen);
             UnregisterHotKey(hwnd_, kHotkeyFallback);
@@ -1645,6 +1705,34 @@ private:
             Notify(L"Captura en curso", L"Espera a que termine la captura anterior.", NIIF_INFO);
             return;
         }
+        activeSettings_ = settings_;
+        if (activeSettings_.delaySeconds) {
+            delayPending_ = true;
+            if (!SetTimer(hwnd_, kCaptureDelayTimer, activeSettings_.delaySeconds * 1000, nullptr)) {
+                delayPending_ = false;
+                captureActive_ = false;
+                Notify(L"Error de retardo", L"No se pudo programar la captura.", NIIF_ERROR);
+                return;
+            }
+            Notify(L"Captura programada", L"Se capturará en " + std::to_wstring(activeSettings_.delaySeconds) +
+                   L" segundos. Puedes cancelarla desde el icono de bandeja.", NIIF_INFO);
+            return;
+        }
+        StartCaptureNow();
+    }
+
+    void OpenLastEditor() {
+        if (!lastCapture_) return;
+        if (editorWindow_ && IsWindow(editorWindow_)) {
+            SendMessageW(editorWindow_, WM_CLOSE, 0, 0);
+            if (IsWindow(editorWindow_)) return;
+        }
+        capture_editor::Image image{lastCapture_->pixelWidth, lastCapture_->pixelHeight,
+                                   lastCapture_->pixelStride, lastCapture_->sdrPixels};
+        editorWindow_ = capture_editor::Editor::Open(std::move(image), lastCaptureSettings_, lastCapture_->sdrPath);
+    }
+
+    void StartCaptureNow() {
         bool usedFullscreenWindow = false;
         previewMonitor_ = CaptureTargetMonitor(usedFullscreenWindow);
         MONITORINFO monitorInfo{sizeof(monitorInfo)};
@@ -1656,14 +1744,15 @@ private:
                       << monitorInfo.rcMonitor.bottom - monitorInfo.rcMonitor.top
                       << (usedFullscreenWindow ? L" (ventana a pantalla completa)" : L" (cursor)");
         Log(targetMessage.str());
-        const CaptureSettings settings = settings_;
+        const CaptureSettings settings = activeSettings_;
         const HMONITOR monitor = previewMonitor_;
-        std::thread([this, monitor, settings] {
+        if (captureWorker_.joinable()) captureWorker_.join();
+        captureWorker_ = std::thread([this, monitor, settings] {
             init_apartment(apartment_type::multi_threaded);
             auto result = std::make_unique<CaptureResult>(
                 CaptureVirtualDesktop(settings, monitor));
-            PostMessageW(hwnd_, kPreviewReady, 0, reinterpret_cast<LPARAM>(result.release()));
-        }).detach();
+            if (PostMessageW(hwnd_, kPreviewReady, 0, reinterpret_cast<LPARAM>(result.get()))) result.release();
+        });
     }
 
     void AddTrayIcon() {
@@ -1797,6 +1886,20 @@ private:
         GetCursorPos(&point);
         HMENU menu = CreatePopupMenu();
         AppendMenuW(menu, MF_STRING, kMenuCapture, L"Capturar región");
+        AppendMenuW(menu, MF_STRING, kMenuWindow, L"Capturar ventana");
+        AppendMenuW(menu, MF_STRING, kMenuMonitor, L"Capturar pantalla");
+        AppendMenuW(menu, MF_STRING, kMenuDesktop, L"Capturar escritorio completo");
+        HMENU delays = CreatePopupMenu();
+        for (UINT seconds : {0u, 3u, 5u, 10u}) {
+            const std::wstring label = seconds ? std::to_wstring(seconds) + L" segundos" : L"Sin retardo";
+            AppendMenuW(delays, MF_STRING | (settings_.delaySeconds == seconds ? MF_CHECKED : 0),
+                        kMenuDelayBase + seconds, label.c_str());
+        }
+        AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(delays), L"Retardo");
+        if (delayPending_) AppendMenuW(menu, MF_STRING, kMenuCancelDelay, L"Cancelar captura programada");
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(menu, MF_STRING | (settings_.openEditor ? MF_CHECKED : 0), kMenuAutoEditor, L"Abrir editor después de capturar");
+        AppendMenuW(menu, MF_STRING | (lastCapture_ ? 0 : MF_GRAYED), kMenuEditor, L"Editar última captura…");
         AppendMenuW(menu, MF_STRING, kMenuOpenFolder, L"Abrir carpeta de capturas");
         AppendMenuW(menu, MF_STRING, kMenuSettings, L"Configuración…");
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
@@ -1835,7 +1938,7 @@ private:
             return;
         }
 
-        RECT desired{0, 0, 420, 285};
+        RECT desired{0, 0, 555, 425};
         AdjustWindowRectEx(&desired, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, FALSE,
                            WS_EX_DLGMODALFRAME);
         const int width = desired.right - desired.left;
@@ -1849,6 +1952,16 @@ private:
             WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, x, y, width, height,
             nullptr, nullptr, instance_, this);
         if (settingsWindow_) {
+            const UINT dpi = GetDpiForWindow(settingsWindow_);
+            RECT scaled{0, 0, MulDiv(555, dpi, 96), MulDiv(425, dpi, 96)};
+            AdjustWindowRectExForDpi(&scaled, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, FALSE,
+                                    WS_EX_DLGMODALFRAME, dpi);
+            const int scaledWidth = scaled.right - scaled.left;
+            const int scaledHeight = scaled.bottom - scaled.top;
+            SetWindowPos(settingsWindow_, nullptr,
+                monitor.rcWork.left + (monitor.rcWork.right - monitor.rcWork.left - scaledWidth) / 2,
+                monitor.rcWork.top + (monitor.rcWork.bottom - monitor.rcWork.top - scaledHeight) / 2,
+                scaledWidth, scaledHeight, SWP_NOZORDER | SWP_NOACTIVATE);
             ShowWindow(settingsWindow_, SW_SHOW);
             SetForegroundWindow(settingsWindow_);
         } else {
@@ -1868,6 +1981,13 @@ private:
     bool printScreenRegistered_ = false;
     bool fallbackRegistered_ = false;
     CaptureSettings settings_ = LoadSettings();
+    CaptureSettings activeSettings_ = settings_;
+    CaptureSettings lastCaptureSettings_ = settings_;
+    CaptureMode captureMode_ = CaptureMode::Region;
+    bool delayPending_ = false;
+    std::thread captureWorker_;
+    std::unique_ptr<CaptureResult> lastCapture_;
+    HWND editorWindow_ = nullptr;
     std::atomic<bool> captureActive_{false};
     std::atomic<bool> printScreenKeyDown_{false};
     inline static App* hookOwner_ = nullptr;
@@ -1902,7 +2022,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
             if (result.ok) {
                 Log(L"Captura puntual guardada: " + result.sdrPath.wstring() +
                     (result.clipboardCopied ? L" · copiada al portapapeles" : L" · sin portapapeles"));
-                if (!result.clipboardCopied) Log(L"AVISO portapapeles: " + result.clipboardError);
+                if (!result.clipboardError.empty()) Log(L"AVISO portapapeles: " + result.clipboardError);
             } else {
                 Log(L"ERROR en captura puntual: " + result.error);
             }

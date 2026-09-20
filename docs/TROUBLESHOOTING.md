@@ -1,5 +1,19 @@
 # Solución de problemas
 
+## No puedo pegar en Steam u otra aplicación
+
+La versión 0.5 publica PNG, DIBV5 y DIB de 24 bits. Comprueba que realmente está ejecutándose el binario actualizado: el instalador usa el ejecutable de `dist`, no uno antiguo que haya quedado abierto.
+
+Prueba un recorte pequeño con el perfil **Ligera** y un destino que admita imágenes. Si falla, comprueba si la imagen puede pegarse en Paint; esto distingue un fallo general del portapapeles de una restricción del receptor. Conserva el archivo guardado para adjuntarlo manualmente si el destino no permite pegar imágenes. El registro indica si se publicó solo parte de los formatos o si otra aplicación mantuvo ocupado el portapapeles.
+
+## Los archivos o los pegados pesan demasiado
+
+Elige **Ligera** o reduce el lado máximo a 1280/1920 px. JPEG ajusta el archivo guardado; las aplicaciones que reciben el portapapeles pueden volver a codificarlo. El límite de resolución sí se aplica a ambas salidas. El peso exacto depende de la escena y PNG puede resultar más pequeño en interfaces con colores planos.
+
+## Quiero capturar sin que aparezca el editor
+
+Desmarca **Abrir editor después de capturar** en el menú de bandeja. Podrás abrir **Editar última captura** cuando lo necesites. Para desactivar capturas programadas elige **Retardo → Sin retardo**.
+
 ## `Impr Pant` no abre el selector
 
 1. Comprueba que el icono de NativeHDRShot está en el área de notificación.

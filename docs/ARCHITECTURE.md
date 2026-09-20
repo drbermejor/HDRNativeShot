@@ -31,7 +31,7 @@ Selección y recorte de región
           │
           ├── PNG BGRA 8 bits, sin pérdida
           ├── JPEG BGR 8 bits, calidad configurable
-          └── Portapapeles CF_DIBV5 (sRGB)
+          └── Portapapeles PNG + CF_DIBV5 (sRGB) + CF_DIB 24 bits
 ```
 
 ## Componentes
@@ -50,7 +50,11 @@ La ventana recibe el ratón de forma normal, sin depender de un hook global que 
 
 Mientras la selección está abierta, un temporizador de vida corta reafirma la posición del selector en la banda `TOPMOST` y recupera el primer plano si otra ventana intenta ocuparlo. Esta vigilancia desaparece junto con el selector y no permanece activa en segundo plano.
 
-El recorte se extrae directamente del búfer congelado y puede atravesar los límites entre monitores. El archivo y el portapapeles contienen exactamente la imagen mostrada durante la selección. Un clic menor de tres píxeles se ignora y mantiene abierto el selector.
+En modo región o pantalla, el recorte se extrae del búfer congelado y puede atravesar los límites entre monitores. Después se aplica, si está configurada, una reducción de resolución proporcional con el filtro Fant de WIC. Un clic menor de tres píxeles en modo región se ignora y mantiene abierto el selector.
+
+El modo ventana enumera ventanas visibles, excluye ventanas minimizadas, ocultas por DWM y herramientas auxiliares, y usa sus límites extendidos para identificar la elección. Al cerrar el selector se adquiere la ventana mediante `IGraphicsCaptureItemInterop::CreateForWindow`, con el blanco SDR del monitor que la contiene. Esto evita incluir las ventanas que la tapen. El fotograma de ventana corresponde al momento de confirmar la elección, no al instante del escritorio congelado.
+
+El retardo usa un temporizador Win32 cancelable antes de iniciar la adquisición. Los trabajadores de preparación y guardado pertenecen a la instancia residente y se unen antes de reutilizarse o destruirla. Las preferencias se congelan al iniciar cada operación.
 
 ### Adquisición
 
@@ -66,14 +70,24 @@ La conversión de lineal a sRGB utiliza la función de transferencia estándar p
 
 ### Portapapeles
 
-Después de guardar el archivo, el mismo búfer SDR BGRA se publica como `CF_DIBV5`, con perfil `LCS_sRGB` y alfa opaco. La memoria se reserva con `GMEM_MOVEABLE` y Windows toma su propiedad cuando `SetClipboardData` termina correctamente. Si el portapapeles está ocupado se realizan varios reintentos cortos; un fallo no elimina ni invalida el archivo guardado.
+Después de guardar el archivo, el búfer SDR BGRA final se publica en este orden: PNG registrado, `CF_DIBV5` con `LCS_sRGB` y alfa opaco, y `CF_DIB` clásico de 24 bits, de abajo hacia arriba y con filas alineadas a cuatro bytes. El PNG evita depender exclusivamente de la interpretación de DIBV5; el DIB clásico ofrece una representación sin alfa ni cabecera extendida. `CF_BITMAP` se sintetiza por Windows.
+
+Los datos se preparan antes de abrir y vaciar el portapapeles. La memoria usa `GMEM_MOVEABLE` y Windows adquiere su propiedad únicamente tras un `SetClipboardData` correcto. Hay reintentos durante aproximadamente un segundo. Los fallos parciales permiten conservar los formatos publicados y se registran; un fallo de portapapeles no invalida el archivo guardado. No se publican rutas de archivos ni texto como sustitutos de la imagen.
 
 ### Codificación
 
 Windows Imaging Component codifica el búfer SDR:
 
 - PNG: `GUID_WICPixelFormat32bppBGRA`;
-- JPEG: `GUID_WICPixelFormat24bppBGR` con `ImageQuality` configurable.
+- JPEG: `GUID_WICPixelFormat24bppBGR` con `ImageQuality` y `JpegYCrCbSubsampling` explícitos (4:4:4 o 4:2:0).
+
+Ambos formatos se etiquetan como sRGB. `src/image_output.h` comparte la codificación, el escalado y los formatos de portapapeles entre captura y editor. Las pruebas comprueban el muestreo real de los archivos JPEG, no solo el valor solicitado al códec.
+
+### Editor
+
+`src/capture_editor.h` implementa una ventana Win32 modeless y rasteriza las anotaciones mediante GDI+. La vista se adapta al espacio disponible y las coordenadas del ratón se convierten a píxeles de la imagen. El historial almacena imágenes para poder deshacer recortes y anotaciones (hasta 20 pasos y un presupuesto de 256 MiB, conservando al menos el último paso).
+
+Copiar exporta los píxeles editados por la misma vía del portapapeles. Guardar como codifica primero un archivo temporal junto al destino y lo sustituye solo cuando la codificación termina. El original autoguardado se mantiene salvo que el usuario elija expresamente sobrescribirlo.
 
 ### Persistencia
 
@@ -83,6 +97,7 @@ Las preferencias se almacenan bajo `HKCU\Software\NativeHDRShot`. El ejecutable 
 
 - Solo puede existir una instancia residente mediante un mutex con nombre.
 - Cada espera de fotograma tiene un timeout de cinco segundos.
+- Los callbacks de captura mantienen su propio estado y referencias D3D, incluso si vence el timeout.
 - Las capturas simultáneas se rechazan hasta que finaliza la anterior.
 - El registro rota al superar 1 MiB.
 - Registro actual: `%LOCALAPPDATA%\NativeHDRShot\NativeHDRShot.log`.
